@@ -114,6 +114,13 @@ pub(super) struct ListInfo {
     pub(super) cache_numeric_reads: bool,
 }
 
+impl ListInfo {
+    pub(super) fn read_expression(&self) -> String {
+        let method = if self.is_stage { "stage_list" } else { "list" };
+        format!("state.{method}({})", self.slot)
+    }
+}
+
 /// generate the module header, saved variable declarations, and target scripts.
 #[cfg(test)]
 pub fn generate(project: &ScratchProject) -> String {

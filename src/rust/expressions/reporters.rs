@@ -41,7 +41,7 @@ pub(in crate::rust) fn expression(
         Some(InputValue::Empty) => unsupported_expression("empty input"),
         Some(InputValue::ListReference(reference)) => lists
             .get(reference.id)
-            .map(|list| format!("state.list({}).contents()", list.slot))
+            .map(|list| format!("{}.contents()", list.read_expression()))
             .unwrap_or_else(|| unsupported_expression("unknown list")),
         None => unsupported_expression("missing or invalid input"),
     }
@@ -97,7 +97,7 @@ pub(super) fn block_expression(
                 arguments,
                 active,
             );
-            return format!("state.list({}).get_cached_number({index})", list.slot);
+            return format!("{}.get_cached_number({index})", list.read_expression());
         }
         input(name, active)
     };
@@ -256,7 +256,7 @@ pub(super) fn block_expression(
             .map(text_literal)
             .unwrap_or_else(|| unsupported_expression("missing sound menu value")),
         "data_listcontents" => list_field(block, "LIST", lists)
-            .map(|list| format!("state.list({}).contents()", list.slot))
+            .map(|list| format!("{}.contents()", list.read_expression()))
             .unwrap_or_else(|| unsupported_expression("missing list reference")),
         "looks_backdrops" => field_value(block, "BACKDROP")
             .map(text_literal)
@@ -286,7 +286,22 @@ pub(super) fn block_expression(
             format!("state.backdrop_number_name({number})")
         }
         "data_itemoflist" => list_field(block, "LIST", lists)
-            .map(|list| format!("state.list({}).get({})", list.slot, input("INDEX", active)))
+            .map(|list| {
+                let method = if comparison_input_is_numeric(
+                    target,
+                    block.inputs.get("INDEX"),
+                    variables,
+                ) {
+                    "get_numeric"
+                } else {
+                    "get"
+                };
+                format!(
+                    "{}.{method}({})",
+                    list.read_expression(),
+                    input("INDEX", active)
+                )
+            })
             .unwrap_or_else(|| unsupported_expression("missing list reference")),
         // forward dropdown selectors unchanged; list operations resolve them when used.
         "data_listindexall" | "data_listindexrandom" => field_value(block, "INDEX")
@@ -294,7 +309,7 @@ pub(super) fn block_expression(
             .map(quote)
             .unwrap_or_else(|| quote("1")),
         "data_lengthoflist" => list_field(block, "LIST", lists)
-            .map(|list| format!("state.list({}).length() as f64", list.slot))
+            .map(|list| format!("{}.length() as f64", list.read_expression()))
             .unwrap_or_else(|| unsupported_expression("missing list reference")),
         "event_broadcast_menu" => block
             .fields
@@ -316,8 +331,8 @@ pub(super) fn block_expression(
         "data_itemnumoflist" => list_field(block, "LIST", lists)
             .map(|list| {
                 format!(
-                    "state.list({}).item_number({}) as f64",
-                    list.slot,
+                    "{}.item_number({}) as f64",
+                    list.read_expression(),
                     input("ITEM", active)
                 )
             })
@@ -354,8 +369,8 @@ pub(super) fn block_expression(
         "data_listcontainsitem" => list_field(block, "LIST", lists)
             .map(|list| {
                 format!(
-                    "state.list({}).contains({})",
-                    list.slot,
+                    "{}.contains({})",
+                    list.read_expression(),
                     input("ITEM", active)
                 )
             })
@@ -603,9 +618,9 @@ pub(super) fn numeric_list_equality(
         }
         let index_expression = index.read_expression();
         let other_expression = other.read_expression();
+        let list_expression = list.read_expression();
         return Some(format!(
-            "{{ let scratch_numeric_list_match = match ({index_expression}, {other_expression}) {{ (ScratchValue::Number(scratch_index), ScratchValue::Number(scratch_value)) => state.list({}).equals_number(*scratch_index, *scratch_value), _ => None }}; scratch_numeric_list_match.unwrap_or_else(|| scratch_equals(state.list({}).get({index_expression}), {other_expression})) }}",
-            list.slot, list.slot
+            "{{ let scratch_numeric_list_match = match ({index_expression}, {other_expression}) {{ (ScratchValue::Number(scratch_index), ScratchValue::Number(scratch_value)) => {list_expression}.equals_number(*scratch_index, *scratch_value), _ => None }}; scratch_numeric_list_match.unwrap_or_else(|| scratch_equals({list_expression}.get({index_expression}), {other_expression})) }}"
         ));
     }
     None

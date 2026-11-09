@@ -839,12 +839,12 @@ pub(super) fn generate_fused_replace_item(
                 output,
                 indent,
                 &format!(
-                    "let (scratch_list_changed, scratch_list_replace_matches) = scratch_list_replace_result.unwrap_or_else(|| {{ let scratch_list_index: ScratchValue = ({}).clone(); let scratch_list_item: ScratchValue = ({}).clone(); let scratch_expected: ScratchValue = ({}).clone(); let scratch_list_changed = state.list_mut({}).replace(scratch_list_index.clone(), scratch_list_item); let scratch_list_replace_matches = scratch_equals(state.list({}).get(&scratch_list_index), &scratch_expected); (scratch_list_changed, scratch_list_replace_matches) }});",
+                    "let (scratch_list_changed, scratch_list_replace_matches) = scratch_list_replace_result.unwrap_or_else(|| {{ let scratch_list_index: ScratchValue = ({}).clone(); let scratch_list_item: ScratchValue = ({}).clone(); let scratch_expected: ScratchValue = ({}).clone(); let scratch_list_changed = state.list_mut({}).replace(scratch_list_index.clone(), scratch_list_item); let scratch_list_replace_matches = scratch_equals({}.get(&scratch_list_index), &scratch_expected); (scratch_list_changed, scratch_list_replace_matches) }});",
                     index.read_expression(),
                     item.read_expression(),
                     compare.expected.read_expression(),
                     list.slot,
-                    list.slot
+                    list.read_expression()
                 ),
             );
             line(

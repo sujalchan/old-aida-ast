@@ -179,11 +179,11 @@ fn pen_rgb_generation_skips_unused_hsv_state_per_target() {
 
     let direct_project = parse_project(&make_project(false).to_string()).unwrap();
     let direct_output = generate(&direct_project);
-    assert!(direct_output.contains("state.set_pen_rgb_color_without_hsv(scratch_pen_color);"));
+    assert!(direct_output.contains("state.set_pen_rgb_color_without_hsv(\"16711680\");"));
 
     let hsv_project = parse_project(&make_project(true).to_string()).unwrap();
     let hsv_output = generate(&hsv_project);
-    assert!(hsv_output.contains("state.set_pen_rgb_color(scratch_pen_color);"));
+    assert!(hsv_output.contains("state.set_pen_rgb_color(\"16711680\");"));
     assert!(hsv_output.contains("state.set_pen_color_parameter("));
 }
 

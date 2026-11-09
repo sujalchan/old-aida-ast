@@ -1,5 +1,34 @@
 use super::*;
 
+fn is_borrowed_scratch_value_input(
+    target: &ScratchTarget,
+    input: Option<&Value>,
+    variables: &HashMap<String, VariableInfo>,
+) -> bool {
+    let borrowed_variable = |variable: &VariableInfo| {
+        variable
+            .index_read_override
+            .as_deref()
+            .is_none_or(|expression| expression.starts_with("&scratch_dynamic_"))
+    };
+    match input.and_then(parse_input) {
+        Some(InputValue::VariableReference(reference)) => {
+            super::super::project::variable_for_target(target, reference.id, variables)
+                .is_some_and(borrowed_variable)
+        }
+        Some(InputValue::BlockReference(id)) => target.blocks.get(id).is_some_and(|block| {
+            match block.opcode.as_str() {
+                "data_itemoflist" => true,
+                "data_variable" => variable_field(block, "VARIABLE", variables)
+                    .is_some_and(|variable| borrowed_variable(&variable)),
+                "argument_reporter_string_number" | "argument_reporter_boolean" => true,
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
 pub(super) struct StructuredBody {
     pub(super) blocks: HashSet<String>,
     pub(super) has_procedure_calls: bool,
@@ -1250,21 +1279,36 @@ pub(super) fn emit_structured_loop_chain<'a>(
                         arguments,
                         &mut HashSet::new(),
                     );
-                    line(
-                        output,
-                        indent,
-                        &format!(
-                            "let scratch_new_value: ScratchValue = ({value}).to_owned().into();"
-                        ),
-                    );
-                    line(
-                        output,
-                        indent,
-                        &format!(
-                            "scratch_dynamic_{0} = scratch_new_value; scratch_dynamic_dirty_{0} = true;",
-                            variable.slot
-                        ),
-                    );
+                    if is_borrowed_scratch_value_input(
+                        target,
+                        block.inputs.get("VALUE"),
+                        variables,
+                    ) {
+                        line(
+                            output,
+                            indent,
+                            &format!(
+                                "scratch_dynamic_{0}.clone_from({value}); scratch_dynamic_dirty_{0} = true;",
+                                variable.slot
+                            ),
+                        );
+                    } else {
+                        line(
+                            output,
+                            indent,
+                            &format!(
+                                "let scratch_new_value: ScratchValue = ({value}).to_owned().into();"
+                            ),
+                        );
+                        line(
+                            output,
+                            indent,
+                            &format!(
+                                "scratch_dynamic_{0} = scratch_new_value; scratch_dynamic_dirty_{0} = true;",
+                                variable.slot
+                            ),
+                        );
+                    }
                     cached_items.retain(|_, item| !item.index_slots.contains(&variable.slot));
                     cached_indexes.remove(&variable.slot);
                 } else if let Some(variable) = numeric_target

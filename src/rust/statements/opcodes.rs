@@ -92,27 +92,33 @@ pub(super) fn generate_resumable_statement(
         "pen_penUp" => line(output, indent, "state.pen_up();"),
         "pen_stamp" => line(output, indent, "state.stamp();"),
         "pen_setPenColorToColor" => {
-            let color = owned_input(
+            let color_expression = expression(
                 target,
                 block.inputs.get("COLOR"),
                 variables,
                 lists,
                 arguments,
+                &mut HashSet::new(),
             );
-            line(
-                output,
-                indent,
-                &format!("let scratch_pen_color: ScratchValue = {color};"),
-            );
-            line(
-                output,
-                indent,
-                if target_has_pen_hsv_controls(target) {
-                    "state.set_pen_rgb_color(scratch_pen_color);"
-                } else {
-                    "state.set_pen_rgb_color_without_hsv(scratch_pen_color);"
-                },
-            );
+            // State-backed reporters cannot be borrowed across a mutable state
+            // receiver; local and literal values can be passed through directly.
+            let color = if color_expression.starts_with("state.") {
+                owned_input(
+                    target,
+                    block.inputs.get("COLOR"),
+                    variables,
+                    lists,
+                    arguments,
+                )
+            } else {
+                color_expression
+            };
+            let setter = if target_has_pen_hsv_controls(target) {
+                format!("state.set_pen_rgb_color({color});")
+            } else {
+                format!("state.set_pen_rgb_color_without_hsv({color});")
+            };
+            line(output, indent, &setter);
         }
         "pen_changePenColorParamBy" | "pen_setPenColorParamTo" => {
             let parameter = pen_color_parameter_input(
@@ -722,9 +728,7 @@ pub(super) fn generate_resumable_statement(
             line(
                 output,
                 indent,
-                &format!(
-                    "let (motion_x, motion_y) = state.position(state.current_instance()).unwrap_or((0.0, 0.0)); state.set_xy(scratch_to_number({x}), motion_y);"
-                ),
+                &format!("state.set_x(scratch_to_number({x}));"),
             );
         }
         "motion_sety" => {
@@ -739,9 +743,7 @@ pub(super) fn generate_resumable_statement(
             line(
                 output,
                 indent,
-                &format!(
-                    "let (motion_x, motion_y) = state.position(state.current_instance()).unwrap_or((0.0, 0.0)); state.set_xy(motion_x, scratch_to_number({y}));"
-                ),
+                &format!("state.set_y(scratch_to_number({y}));"),
             );
         }
         "motion_pointindirection" => {
@@ -1190,7 +1192,7 @@ pub(super) fn variable_input(
                     arguments,
                     &mut HashSet::new(),
                 );
-                Some(format!("state.list({}).get({index})", list.slot))
+                Some(format!("{}.get({index})", list.read_expression()))
             } else {
                 None
             }
