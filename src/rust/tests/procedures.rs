@@ -76,8 +76,7 @@ fn emits_custom_blocks_as_resumable_argument_frames() {
     let output = generate(&project);
     assert!(output.contains("arguments[0]).clone()"));
     assert!(output.contains("\"hello\").to_owned().into()"));
-    assert!(output.contains("script.frames.push(ProcedureFrame"));
-    assert!(output.contains("script.frames.push(ProcedureFrame::new("));
+    assert!(output.contains("script.push_frame("));
     assert!(output.contains("new_clone_start_script_sprite1_"));
 }
 
@@ -120,7 +119,7 @@ fn clone_nested_custom_calls_preserve_warp_mode_and_the_callers_pc() {
     assert!(
         output.contains("if script.yield_at_safe_point(clock) { return ScriptStatus::Yield; }")
     );
-    assert!(output.contains("_ => { script.frames.pop(); continue; }"));
+    assert!(output.contains("_ => { script.pop_frame(); continue; }"));
     assert!(output.contains("print_value!(state, \"say\", scratch_bubble_text.clone());"));
 }
 
@@ -225,6 +224,68 @@ fn identical_event_scripts_reuse_one_statically_dispatched_step_body() {
 }
 
 #[test]
+fn nested_branch_only_warp_calls_use_a_static_path_with_resumable_watchdog_fallback() {
+    let mut blocks = json!({
+        "hat": {"opcode":"event_whenflagclicked", "next":"call_outer", "topLevel":true, "inputs":{}, "fields":{}},
+        "call_outer": {"opcode":"procedures_call", "parent":"hat", "inputs":{}, "fields":{}, "mutation":{"proccode":"outer", "argumentids":"[]", "warp":"true"}},
+        "outer_definition": {"opcode":"procedures_definition", "next":"outer_branch", "topLevel":true, "inputs":{"custom_block":[1,"outer_prototype"]}, "fields":{}},
+        "outer_prototype": {"opcode":"procedures_prototype", "parent":"outer_definition", "inputs":{}, "fields":{}, "mutation":{"proccode":"outer", "argumentnames":"[]", "argumentids":"[]", "argumentdefaults":"[]", "warp":"true"}},
+        "outer_branch": {"opcode":"control_if_else", "parent":"outer_definition", "inputs":{"CONDITION":[2,"outer_condition"],"SUBSTACK":[2,"call_large"],"SUBSTACK2":[2,"call_small"]}, "fields":{}},
+        "outer_condition": {"opcode":"operator_equals", "parent":"outer_branch", "inputs":{"OPERAND1":[1,[4,"1"]],"OPERAND2":[1,[4,"1"]]}, "fields":{}},
+        "call_large": {"opcode":"procedures_call", "parent":"outer_branch", "inputs":{}, "fields":{}, "mutation":{"proccode":"large", "argumentids":"[]", "warp":"true"}},
+        "call_small": {"opcode":"procedures_call", "parent":"outer_branch", "inputs":{}, "fields":{}, "mutation":{"proccode":"small", "argumentids":"[]", "warp":"true"}},
+        "large_definition": {"opcode":"procedures_definition", "next":"large_if", "topLevel":true, "inputs":{"custom_block":[1,"large_prototype"]}, "fields":{}},
+        "large_prototype": {"opcode":"procedures_prototype", "parent":"large_definition", "inputs":{}, "fields":{}, "mutation":{"proccode":"large", "argumentnames":"[]", "argumentids":"[]", "argumentdefaults":"[]", "warp":"true"}},
+        "large_if": {"opcode":"control_if_else", "parent":"large_definition", "inputs":{"CONDITION":[2,"large_condition"],"SUBSTACK":[2,"large_yes_0"],"SUBSTACK2":[2,"large_no_0"]}, "fields":{}},
+        "large_condition": {"opcode":"operator_equals", "parent":"large_if", "inputs":{"OPERAND1":[1,[4,"1"]],"OPERAND2":[1,[4,"1"]]}, "fields":{}},
+        "small_definition": {"opcode":"procedures_definition", "next":"small_change", "topLevel":true, "inputs":{"custom_block":[1,"small_prototype"]}, "fields":{}},
+        "small_prototype": {"opcode":"procedures_prototype", "parent":"small_definition", "inputs":{}, "fields":{}, "mutation":{"proccode":"small", "argumentnames":"[]", "argumentids":"[]", "argumentdefaults":"[]", "warp":"true"}},
+        "small_change": {"opcode":"data_changevariableby", "next":"small_stop", "parent":"small_definition", "inputs":{"VALUE":[1,[4,"1"]]}, "fields":{"VARIABLE":["count","count_id"]}},
+        "small_stop": {"opcode":"control_stop", "parent":"small_change", "inputs":{}, "fields":{"STOP_OPTION":["this script", null]}}
+    });
+    let blocks = blocks.as_object_mut().unwrap();
+    for (branch, count) in [("large_yes", 42), ("large_no", 41)] {
+        for index in 0..count {
+            let id = format!("{branch}_{index}");
+            let next = (index + 1 < count).then(|| format!("{branch}_{}", index + 1));
+            blocks.insert(
+                id,
+                json!({
+                    "opcode":"data_changevariableby",
+                    "next":next,
+                    "parent":if index == 0 {"large_if".to_owned()} else {format!("{branch}_{}", index - 1)},
+                    "inputs":{"VALUE":[1,[4,"1"]]},
+                    "fields":{"VARIABLE":["count","count_id"]}
+                }),
+            );
+        }
+    }
+
+    let project = parse_project(
+        &json!({
+            "targets": [{
+                "name": "Sprite1",
+                "isStage": false,
+                "variables": {"count_id": ["count", 0]},
+                "blocks": blocks
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = generate(&project);
+    assert!(output.contains("fn direct_warp_procedure_0_"));
+    assert!(output.contains("if script.warp_budget.expired(clock) {"));
+    assert!(output.contains("script.push_frame("));
+    assert!(output.contains("direct_warp_procedure_0_"));
+    assert!(output.contains("-> bool {"));
+    assert!(output.contains("return false;"));
+    assert!(output.contains("return ScriptStatus::Complete;"));
+    assert!(output.contains("if inherited_warp || true {"));
+}
+
+#[test]
 fn wait_in_custom_block_advances_its_frame_before_scheduler_suspension() {
     let project = parse_project(
             &json!({
@@ -295,12 +356,7 @@ fn resumable_procedure_body_is_emitted_once_for_multiple_scripts() {
     let output = generate(&project);
     assert_eq!(output.matches("fn step_procedures_0(").count(), 1);
     assert_eq!(output.matches("=> match pc {").count(), 1);
-    assert_eq!(
-        output
-            .matches("script.frames.push(ProcedureFrame::new(")
-            .count(),
-        1
-    );
+    assert_eq!(output.matches("script.push_frame(").count(), 1);
     assert!(output.contains("use self::step_green_flag_script_sprite1_"));
     assert!(output.contains(" as step_green_flag_script_sprite1_"));
 

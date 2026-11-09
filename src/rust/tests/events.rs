@@ -94,6 +94,14 @@ fn keypress_hats_start_generated_scripts_from_input_edges() {
     assert!(output.contains("fn new_keypress_scripts(key: &str, state: &ScratchState)"));
     assert!(output.contains("\"space\" => { for instance in state.instances_for_target(0)"));
     assert!(output.contains("self.scheduler.start_key_hats(scripts)"));
+    assert!(output.lines().any(|line| {
+        line.starts_with("fn new_key_pressed_script_") && line.contains("_for(instance")
+    }));
+    assert!(
+        !output.lines().any(|line| {
+            line.starts_with("fn new_key_pressed_script_") && !line.contains("_for(")
+        })
+    );
 }
 
 // check that the special any selector is emitted before key-specific hats.

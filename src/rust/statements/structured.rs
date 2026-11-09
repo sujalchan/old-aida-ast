@@ -198,6 +198,7 @@ pub(super) struct TypedNumericSetContext<'a> {
     pub(super) arguments: &'a HashMap<String, String>,
     pub(super) deferred: &'a HashSet<usize>,
     pub(super) textual: &'a HashSet<usize>,
+    pub(super) dirty_tracking: bool,
 }
 
 pub(super) fn emit_typed_numeric_set(
@@ -214,6 +215,7 @@ pub(super) fn emit_typed_numeric_set(
         arguments,
         deferred,
         textual,
+        dirty_tracking,
     } = context;
     let value = expression(
         target,
@@ -229,11 +231,13 @@ pub(super) fn emit_typed_numeric_set(
         &format!("scratch_typed_{} = {value};", variable.slot),
     );
     if deferred.contains(&variable.slot) {
-        line(
-            output,
-            indent,
-            &format!("scratch_dirty_{} = true;", variable.slot),
-        );
+        if dirty_tracking {
+            line(
+                output,
+                indent,
+                &format!("scratch_dirty_{} = true;", variable.slot),
+            );
+        }
         if textual.contains(&variable.slot) {
             line(
                 output,
@@ -251,6 +255,29 @@ pub(super) fn emit_typed_numeric_set(
             output,
             indent,
             &format!("state.{setter}({0}, scratch_typed_{0});", variable.slot),
+        );
+    }
+}
+
+pub(super) fn emit_definite_numeric_commits(
+    output: &mut String,
+    indent: usize,
+    numeric: &[VariableInfo],
+    deferred: &HashSet<usize>,
+) {
+    for variable in numeric.iter().filter(|v| deferred.contains(&v.slot)) {
+        let setter = if variable.is_stage {
+            "set_shared_number"
+        } else {
+            "set_local_number"
+        };
+        line(
+            output,
+            indent,
+            &format!(
+                "state.{setter}({}, scratch_typed_{});",
+                variable.slot, variable.slot
+            ),
         );
     }
 }
@@ -558,6 +585,17 @@ pub(super) fn emit_deferred_numeric_flush(
     deferred: &HashSet<usize>,
     textual: &HashSet<usize>,
 ) {
+    emit_deferred_numeric_flush_with_reset(output, indent, variables, deferred, textual, true);
+}
+
+fn emit_deferred_numeric_flush_with_reset(
+    output: &mut String,
+    indent: usize,
+    variables: &HashMap<String, VariableInfo>,
+    deferred: &HashSet<usize>,
+    textual: &HashSet<usize>,
+    clear_dirty: bool,
+) {
     let mut slots = deferred.iter().copied().collect::<Vec<_>>();
     slots.sort_unstable();
     for slot in slots {
@@ -577,7 +615,12 @@ pub(super) fn emit_deferred_numeric_flush(
                     output,
                     indent,
                     &format!(
-                        "if scratch_dirty_{slot} {{ if scratch_text_{slot} {{ state.{string_setter}({slot}, ScratchValue::Text(scratch_string(scratch_typed_{slot}))); }} else {{ state.{setter}({slot}, scratch_typed_{slot}); }} scratch_dirty_{slot} = false; }}"
+                        "if scratch_dirty_{slot} {{ if scratch_text_{slot} {{ state.{string_setter}({slot}, ScratchValue::Text(scratch_string(scratch_typed_{slot}))); }} else {{ state.{setter}({slot}, scratch_typed_{slot}); }}{} }}",
+                        if clear_dirty {
+                            format!(" scratch_dirty_{slot} = false;")
+                        } else {
+                            String::new()
+                        }
                     ),
                 );
             } else {
@@ -585,12 +628,24 @@ pub(super) fn emit_deferred_numeric_flush(
                     output,
                     indent,
                     &format!(
-                        "if scratch_dirty_{slot} {{ state.{setter}({slot}, scratch_typed_{slot}); scratch_dirty_{slot} = false; }}"
+                        "if scratch_dirty_{slot} {{ state.{setter}({slot}, scratch_typed_{slot});{} }}",
+                        if clear_dirty {
+                            format!(" scratch_dirty_{slot} = false;")
+                        } else {
+                            String::new()
+                        }
                     ),
                 );
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct PartialStructuredOutcome {
+    pub(super) requires_escape_label: bool,
+    pub(super) exits_region: bool,
+    pub(super) deferred_flushed: bool,
 }
 
 pub(super) fn collect_input_slots(
@@ -820,14 +875,16 @@ pub(super) fn emit_partial_structured_chain<'a>(
     entries: &HashMap<String, ProcedureEntry>,
     no_warp_timer: bool,
     repeat_slot: Option<usize>,
+    flush_on_direct_call: bool,
     output: &mut String,
     indent: usize,
-) -> bool {
+) -> PartialStructuredOutcome {
     let mut requires_escape_label = false;
+    let mut exited_path_without_flush = false;
     while let Some(current) = id {
         let block = &target.blocks[current];
         if matches!(block.opcode.as_str(), "control_if" | "control_if_else") {
-            let condition = boolean_input(
+            let mut condition = boolean_input(
                 target,
                 block,
                 "CONDITION",
@@ -846,10 +903,42 @@ pub(super) fn emit_partial_structured_chain<'a>(
                         _ => None,
                     })
             };
+            let yes_branch = branch("SUBSTACK");
+            let no_branch = branch("SUBSTACK2");
+            let direct_procedure_call = |branch_id: Option<&str>| {
+                branch_id
+                    .and_then(|id| target.blocks.get(id))
+                    .filter(|branch_block| branch_block.opcode == "procedures_call")
+                    .and_then(|branch_block| procedure_for_call(branch_block, procedures))
+                    .and_then(|procedure| entries.get(&procedure.definition_id))
+                    .is_some_and(|entry| entry.direct_name.is_some())
+            };
+            let hoist_flush = block.opcode == "control_if_else"
+                && !deferred.is_empty()
+                && direct_procedure_call(yes_branch)
+                && direct_procedure_call(no_branch);
+            if hoist_flush {
+                let condition_name =
+                    format!("scratch_branch_condition_{}", graph.block_pcs[current]);
+                line(
+                    output,
+                    indent,
+                    &format!("let {condition_name} = {condition};"),
+                );
+                emit_deferred_numeric_flush_with_reset(
+                    output,
+                    indent,
+                    original_variables,
+                    deferred,
+                    textual,
+                    false,
+                );
+                condition = condition_name;
+            }
             line(output, indent, &format!("if {condition} {{"));
-            requires_escape_label |= emit_partial_structured_chain(
+            let yes_outcome = emit_partial_structured_chain(
                 target,
-                branch("SUBSTACK"),
+                yes_branch,
                 graph,
                 variables,
                 original_variables,
@@ -862,14 +951,16 @@ pub(super) fn emit_partial_structured_chain<'a>(
                 entries,
                 no_warp_timer,
                 repeat_slot,
+                !hoist_flush,
                 output,
                 indent + 1,
             );
+            requires_escape_label |= yes_outcome.requires_escape_label;
             if block.opcode == "control_if_else" {
                 line(output, indent, "} else {");
-                requires_escape_label |= emit_partial_structured_chain(
+                let no_outcome = emit_partial_structured_chain(
                     target,
-                    branch("SUBSTACK2"),
+                    no_branch,
                     graph,
                     variables,
                     original_variables,
@@ -882,9 +973,25 @@ pub(super) fn emit_partial_structured_chain<'a>(
                     entries,
                     no_warp_timer,
                     repeat_slot,
+                    !hoist_flush,
                     output,
                     indent + 1,
                 );
+                requires_escape_label |= no_outcome.requires_escape_label;
+                if yes_outcome.exits_region && no_outcome.exits_region {
+                    line(output, indent, "}");
+                    return PartialStructuredOutcome {
+                        requires_escape_label,
+                        exits_region: true,
+                        deferred_flushed: yes_outcome.deferred_flushed
+                            && no_outcome.deferred_flushed,
+                    };
+                }
+                exited_path_without_flush |= (yes_outcome.exits_region
+                    && !yes_outcome.deferred_flushed)
+                    || (no_outcome.exits_region && !no_outcome.deferred_flushed);
+            } else if yes_outcome.exits_region && !yes_outcome.deferred_flushed {
+                exited_path_without_flush = true;
             }
             line(output, indent, "}");
         } else if structured_sync_statement(&block.opcode) {
@@ -925,6 +1032,7 @@ pub(super) fn emit_partial_structured_chain<'a>(
                         arguments,
                         deferred,
                         textual,
+                        dirty_tracking: true,
                     },
                     block,
                     variable.as_ref().unwrap(),
@@ -1025,7 +1133,19 @@ pub(super) fn emit_partial_structured_chain<'a>(
                 .and_then(|p| entries.get(&p.definition_id))
                 .is_some_and(|entry| entry.direct_name.is_some())
         {
-            emit_deferred_numeric_flush(output, indent, original_variables, deferred, textual);
+            if flush_on_direct_call {
+                // A direct procedure call exits this compiled region immediately
+                // after it returns. The dirty flags are therefore dead after this
+                // commit and do not need the reset emitted by the reusable flush.
+                emit_deferred_numeric_flush_with_reset(
+                    output,
+                    indent,
+                    original_variables,
+                    deferred,
+                    textual,
+                    false,
+                );
+            }
             if let Some(slot) = repeat_slot {
                 line(
                     output,
@@ -1062,7 +1182,11 @@ pub(super) fn emit_partial_structured_chain<'a>(
             );
             line(output, indent, "scratch_region_escaped = true;");
             line(output, indent, "break 'scratch_compiled_loop;");
-            return true;
+            return PartialStructuredOutcome {
+                requires_escape_label: true,
+                exits_region: true,
+                deferred_flushed: !exited_path_without_flush,
+            };
         } else {
             line(
                 output,
@@ -1074,11 +1198,18 @@ pub(super) fn emit_partial_structured_chain<'a>(
             );
             line(output, indent, "scratch_region_escaped = true;");
             line(output, indent, "break 'scratch_compiled_loop;");
-            return true;
+            return PartialStructuredOutcome {
+                requires_escape_label: true,
+                exits_region: true,
+                deferred_flushed: false,
+            };
         }
         id = block.next.as_deref();
     }
-    requires_escape_label
+    PartialStructuredOutcome {
+        requires_escape_label,
+        ..PartialStructuredOutcome::default()
+    }
 }
 
 pub(super) struct StructuredLoopContext<'a> {
@@ -1278,6 +1409,7 @@ pub(super) fn emit_structured_loop_chain<'a>(
                             arguments,
                             deferred,
                             textual,
+                            dirty_tracking: true,
                         },
                         block,
                         &variable,

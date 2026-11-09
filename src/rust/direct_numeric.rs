@@ -24,6 +24,12 @@ struct NumericExpr {
     kind: Kind,
 }
 
+#[derive(Clone, Default)]
+struct WriteState {
+    definite: HashSet<usize>,
+    possible: HashSet<usize>,
+}
+
 struct Compiler<'a> {
     target: &'a ScratchTarget,
     variables: &'a HashMap<String, VariableInfo>,
@@ -33,37 +39,43 @@ struct Compiler<'a> {
     all: BTreeMap<usize, VariableInfo>,
     needed: BTreeMap<usize, VariableInfo>,
     assigned: BTreeMap<usize, VariableInfo>,
+    numeric_reads: HashSet<usize>,
     number_assignments: HashSet<usize>,
     dynamic_assignments: HashSet<usize>,
+    deferred: HashSet<usize>,
+    dirty: HashSet<usize>,
+    flush_states: Vec<WriteState>,
     statements: usize,
 }
 
 impl<'a> Compiler<'a> {
     fn deferred_slots(&self) -> HashSet<usize> {
-        self.number_assignments
-            .difference(&self.dynamic_assignments)
-            .copied()
-            .collect()
+        self.deferred.clone()
     }
 
-    fn emit_deferred_commits(&self, out: &mut String, indent: usize) {
-        let deferred = self.deferred_slots();
-        for variable in self
-            .assigned
-            .values()
-            .filter(|variable| deferred.contains(&variable.slot))
-        {
+    fn emit_deferred_commits(&self, out: &mut String, indent: usize, writes: &WriteState) {
+        for variable in self.assigned.values().filter(|variable| {
+            self.deferred.contains(&variable.slot) && writes.possible.contains(&variable.slot)
+        }) {
             let setter = if variable.is_stage {
                 "set_shared_number"
             } else {
                 "set_local_number"
             };
+            let condition = if writes.definite.contains(&variable.slot) {
+                format!("scratch_defer_{}", variable.slot)
+            } else {
+                format!(
+                    "scratch_defer_{} && scratch_dirty_{}",
+                    variable.slot, variable.slot
+                )
+            };
             line(
                 out,
                 indent,
                 &format!(
-                    "if scratch_defer_{} && scratch_dirty_{} {{ state.{setter}({}, numeric_{}); }}",
-                    variable.slot, variable.slot, variable.slot, variable.slot
+                    "if {condition} {{ state.{setter}({}, numeric_{}); }}",
+                    variable.slot, variable.slot
                 ),
             );
         }
@@ -71,6 +83,7 @@ impl<'a> Compiler<'a> {
 
     fn read_variable(&mut self, variable: VariableInfo, written: &HashSet<usize>) -> NumericExpr {
         self.all.insert(variable.slot, variable.clone());
+        self.numeric_reads.insert(variable.slot);
         if !written.contains(&variable.slot) {
             self.needed.insert(variable.slot, variable.clone());
         }
@@ -213,10 +226,11 @@ impl<'a> Compiler<'a> {
         &mut self,
         mut id: Option<&'a str>,
         written: &mut HashSet<usize>,
+        possible_written: &mut HashSet<usize>,
         out: &mut String,
         indent: usize,
         seen: &mut HashSet<String>,
-    ) -> Option<()> {
+    ) -> Option<bool> {
         while let Some(current) = id {
             if !seen.insert(current.to_owned()) {
                 return None;
@@ -239,21 +253,66 @@ impl<'a> Compiler<'a> {
                             })
                     };
                     let mut yes = written.clone();
-                    self.chain(branch("SUBSTACK"), &mut yes, out, indent + 1, seen)?;
+                    let mut yes_possible = possible_written.clone();
+                    let yes_reaches = self.chain(
+                        branch("SUBSTACK"),
+                        &mut yes,
+                        &mut yes_possible,
+                        out,
+                        indent + 1,
+                        seen,
+                    )?;
                     let mut no = written.clone();
+                    let mut no_possible = possible_written.clone();
                     if block.opcode == "control_if_else" {
                         line(out, indent, "} else {");
-                        self.chain(branch("SUBSTACK2"), &mut no, out, indent + 1, seen)?;
+                        let no_reaches = self.chain(
+                            branch("SUBSTACK2"),
+                            &mut no,
+                            &mut no_possible,
+                            out,
+                            indent + 1,
+                            seen,
+                        )?;
+                        line(out, indent, "}");
+                        match (yes_reaches, no_reaches) {
+                            (true, true) => {
+                                *written = yes.intersection(&no).copied().collect();
+                                *possible_written =
+                                    yes_possible.union(&no_possible).copied().collect();
+                            }
+                            (true, false) => {
+                                *written = yes;
+                                *possible_written = yes_possible;
+                            }
+                            (false, true) => {
+                                *written = no;
+                                *possible_written = no_possible;
+                            }
+                            (false, false) => return Some(false),
+                        }
+                    } else {
+                        line(out, indent, "}");
+                        // The implicit else path reaches the continuation unchanged.
+                        if yes_reaches {
+                            *written = yes.intersection(written).copied().collect();
+                            *possible_written =
+                                yes_possible.union(possible_written).copied().collect();
+                        }
                     }
-                    line(out, indent, "}");
-                    *written = yes.intersection(&no).copied().collect();
                 }
                 "control_stop"
                     if field_value(block, "STOP_OPTION").and_then(Value::as_str)
                         == Some("this script") =>
                 {
-                    self.emit_deferred_commits(out, indent);
-                    line(out, indent, "return;")
+                    let writes = WriteState {
+                        definite: written.clone(),
+                        possible: possible_written.clone(),
+                    };
+                    self.flush_states.push(writes.clone());
+                    self.emit_deferred_commits(out, indent, &writes);
+                    line(out, indent, "return;");
+                    return Some(false);
                 }
                 "data_setvariableto" => {
                     let variable = variable_field(block, "VARIABLE", self.variables)?;
@@ -336,22 +395,43 @@ impl<'a> Compiler<'a> {
                         } else {
                             "set_local_number"
                         };
+                        if self.deferred.contains(&variable.slot) {
+                            let dirty = if self.dirty.contains(&variable.slot) {
+                                format!(" scratch_dirty_{} = true;", variable.slot)
+                            } else {
+                                String::new()
+                            };
+                            line(
+                                out,
+                                indent,
+                                &format!(
+                                    "if scratch_defer_{slot} {{ numeric_{slot} = numeric_new;{dirty} }} else {{ state.{setter}({slot}, numeric_new); }}",
+                                    slot = variable.slot,
+                                    setter = setter
+                                ),
+                            );
+                        } else {
+                            // This slot also receives a value with dynamic Scratch
+                            // representation elsewhere in the procedure. Deferral
+                            // is statically unsafe, so emit only the immediate path.
+                            line(
+                                out,
+                                indent,
+                                &format!("state.{setter}({}, numeric_new);", variable.slot),
+                            );
+                        }
+                    }
+                    if self.numeric_reads.contains(&variable.slot)
+                        || self.deferred.contains(&variable.slot)
+                    {
                         line(
                             out,
                             indent,
-                            &format!(
-                                "if scratch_defer_{slot} {{ numeric_{slot} = numeric_new; scratch_dirty_{slot} = true; }} else {{ state.{setter}({slot}, numeric_new); }}",
-                                slot = variable.slot,
-                                setter = setter
-                            ),
+                            &format!("numeric_{} = numeric_new;", variable.slot),
                         );
                     }
-                    line(
-                        out,
-                        indent,
-                        &format!("numeric_{} = numeric_new;", variable.slot),
-                    );
                     written.insert(variable.slot);
+                    possible_written.insert(variable.slot);
                 }
                 "motion_gotoxy" => {
                     let x = self.expr(block.inputs.get("X"), written, &mut HashSet::new())?;
@@ -374,7 +454,7 @@ impl<'a> Compiler<'a> {
             }
             id = block.next.as_deref();
         }
-        Some(())
+        Some(true)
     }
 }
 
@@ -393,7 +473,7 @@ pub(super) fn generate_numeric_direct(
     name: &str,
     numeric_args_only: bool,
 ) -> Option<String> {
-    let args = procedure
+    let args: HashMap<String, usize> = procedure
         .argument_names
         .iter()
         .enumerate()
@@ -414,33 +494,77 @@ pub(super) fn generate_numeric_direct(
             )
         })
         .collect::<HashMap<_, _>>();
-    let mut compiler = Compiler {
+    let make_compiler = |deferred: HashSet<usize>, dirty: HashSet<usize>| Compiler {
         target,
         variables,
         argument_values: &argument_values,
         lists,
-        arguments: args,
+        arguments: args.clone(),
         all: BTreeMap::new(),
         needed: BTreeMap::new(),
         assigned: BTreeMap::new(),
+        numeric_reads: HashSet::new(),
         number_assignments: HashSet::new(),
         dynamic_assignments: HashSet::new(),
+        deferred,
+        dirty,
+        flush_states: Vec::new(),
         statements: 0,
     };
     let definition = target.blocks.get(&procedure.definition_id)?;
-    let mut body = String::new();
-    compiler.chain(
+    // First walk the procedure as a control-flow graph. This computes which
+    // assignments can be deferred and which flushes are definitely dirty,
+    // before any optimized Rust is emitted.
+    let mut analysis = make_compiler(HashSet::new(), HashSet::new());
+    let mut analysis_body = String::new();
+    let mut analysis_written = HashSet::new();
+    let mut analysis_possible = HashSet::new();
+    let reaches_exit = analysis.chain(
         definition.next.as_deref(),
+        &mut analysis_written,
+        &mut analysis_possible,
+        &mut analysis_body,
+        1,
         &mut HashSet::new(),
+    )?;
+    if reaches_exit {
+        analysis.flush_states.push(WriteState {
+            definite: analysis_written,
+            possible: analysis_possible,
+        });
+    }
+    // Avoid creating extra versions of tiny procedures. Numeric calculation
+    // and branch-only procedures benefit too; they need not contain motion.
+    if analysis.statements < 12 {
+        return None;
+    }
+    let deferred = analysis
+        .number_assignments
+        .difference(&analysis.dynamic_assignments)
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut dirty = HashSet::new();
+    for flush in &analysis.flush_states {
+        dirty.extend(
+            deferred
+                .iter()
+                .filter(|slot| flush.possible.contains(slot) && !flush.definite.contains(slot))
+                .copied(),
+        );
+    }
+
+    let mut compiler = make_compiler(deferred, dirty);
+    let mut body = String::new();
+    let mut written = HashSet::new();
+    let mut possible_written = HashSet::new();
+    let reaches_exit = compiler.chain(
+        definition.next.as_deref(),
+        &mut written,
+        &mut possible_written,
         &mut body,
         1,
         &mut HashSet::new(),
     )?;
-    // Avoid creating extra versions of tiny procedures. Numeric calculation
-    // and branch-only procedures benefit too; they need not contain motion.
-    if compiler.statements < 12 {
-        return None;
-    }
     let params = (0..procedure.argument_ids.len())
         .map(|i| {
             if numeric_args_only {
@@ -487,7 +611,11 @@ pub(super) fn generate_numeric_direct(
             );
         }
     }
+    let deferred_slots = compiler.deferred_slots();
     for (slot, variable) in &compiler.all {
+        if !compiler.numeric_reads.contains(slot) && !deferred_slots.contains(slot) {
+            continue;
+        }
         if compiler.needed.contains_key(slot) {
             line(
                 &mut output,
@@ -505,23 +633,16 @@ pub(super) fn generate_numeric_direct(
             );
         }
     }
-    let deferred_slots = compiler.deferred_slots();
-    for slot in compiler.assigned.keys() {
-        if deferred_slots.contains(slot) {
+    for slot in &deferred_slots {
+        if compiler.assigned.contains_key(slot) {
             line(
                 &mut output,
                 1,
                 &format!("let scratch_defer_{slot} = state.can_defer_variable_writes(&[{slot}]);"),
             );
-        } else {
-            line(
-                &mut output,
-                1,
-                &format!("let scratch_defer_{slot} = false;"),
-            );
         }
     }
-    for slot in compiler.assigned.keys() {
+    for slot in &compiler.dirty {
         line(
             &mut output,
             1,
@@ -529,7 +650,16 @@ pub(super) fn generate_numeric_direct(
         );
     }
     output.push_str(&body);
-    compiler.emit_deferred_commits(&mut output, 1);
+    if reaches_exit {
+        compiler.emit_deferred_commits(
+            &mut output,
+            1,
+            &WriteState {
+                definite: written,
+                possible: possible_written,
+            },
+        );
+    }
     line(&mut output, 0, "}\n");
     Some(output)
 }

@@ -3,12 +3,33 @@ use super::*;
 pub(in crate::rust) struct DirectProcedureOptions {
     pub(in crate::rust) target_index: usize,
     pub(in crate::rust) fast_math: bool,
-    pub(in crate::rust) no_warp_timer: bool,
     pub(in crate::rust) reachable_procedure_ids: HashSet<String>,
     pub(in crate::rust) numeric_call_procedure_ids: HashSet<String>,
 }
 
-pub(super) fn direct_eligible(target: &ScratchTarget, procedure: &ProcedureSignature) -> bool {
+pub(super) fn direct_eligible(
+    target: &ScratchTarget,
+    procedure: &ProcedureSignature,
+    procedures: &[ProcedureSignature],
+) -> bool {
+    direct_eligible_inner(target, procedure, procedures, &mut HashSet::new(), true)
+}
+
+fn direct_call_eligible(
+    target: &ScratchTarget,
+    procedure: &ProcedureSignature,
+    procedures: &[ProcedureSignature],
+) -> bool {
+    direct_eligible_inner(target, procedure, procedures, &mut HashSet::new(), false)
+}
+
+fn direct_eligible_inner(
+    target: &ScratchTarget,
+    procedure: &ProcedureSignature,
+    procedures: &[ProcedureSignature],
+    visiting: &mut HashSet<String>,
+    allow_stop_this_script: bool,
+) -> bool {
     if procedure.argument_names.len() != procedure.argument_ids.len()
         || procedure
             .argument_names
@@ -19,17 +40,24 @@ pub(super) fn direct_eligible(target: &ScratchTarget, procedure: &ProcedureSigna
     {
         return false;
     }
+    if !visiting.insert(procedure.definition_id.clone()) {
+        return false;
+    }
     let Some(definition) = target.blocks.get(&procedure.definition_id) else {
+        visiting.remove(&procedure.definition_id);
         return false;
     };
     let mut pending: Vec<&str> = definition.next.as_deref().into_iter().collect();
     let mut seen = HashSet::new();
+    let mut eligible = true;
     while let Some(id) = pending.pop() {
         if !seen.insert(id) || seen.len() > 80 {
-            return false;
+            eligible = false;
+            break;
         }
         let Some(block) = target.blocks.get(id) else {
-            return false;
+            eligible = false;
+            break;
         };
         match block.opcode.as_str() {
             "control_if" | "control_if_else" => {
@@ -42,21 +70,49 @@ pub(super) fn direct_eligible(target: &ScratchTarget, procedure: &ProcedureSigna
                 }
             }
             "control_stop"
-                if field_value(block, "STOP_OPTION").and_then(Value::as_str)
-                    == Some("this script") => {}
+                if allow_stop_this_script
+                    && field_value(block, "STOP_OPTION").and_then(Value::as_str)
+                        == Some("this script") => {}
+            "procedures_call" => {
+                let Some(callee) = procedure_for_call(block, procedures) else {
+                    eligible = false;
+                    break;
+                };
+                if !direct_eligible_inner(target, callee, procedures, visiting, false) {
+                    eligible = false;
+                    break;
+                }
+            }
             "data_setvariableto"
             | "data_changevariableby"
+            | "data_addtolist"
+            | "data_deleteoflist"
+            | "data_deletealloflist"
+            | "data_insertatlist"
             | "data_replaceitemoflist"
             | "motion_gotoxy"
+            | "motion_setx"
+            | "motion_sety"
+            | "pen_clear"
             | "pen_penDown"
-            | "pen_penUp" => {}
-            _ => return false,
+            | "pen_penUp"
+            | "pen_stamp"
+            | "pen_setPenColorToColor"
+            | "pen_changePenColorParamBy"
+            | "pen_setPenColorParamTo"
+            | "pen_setPenSizeTo"
+            | "pen_changePenSizeBy" => {}
+            _ => {
+                eligible = false;
+                break;
+            }
         }
         if let Some(next) = block.next.as_deref() {
             pending.push(next);
         }
     }
-    true
+    visiting.remove(&procedure.definition_id);
+    eligible
 }
 
 pub(super) fn direct_warp_name(target_index: usize, frame_id: usize) -> String {
@@ -73,6 +129,12 @@ pub(super) fn direct_warp_eligible(
     if let Some(eligible) = memo.get(&procedure.definition_id) {
         return *eligible;
     }
+    // Direct warp calls are synchronous: keep them to shallow control flow
+    // that cannot spin indefinitely. Counted repeat loops are finite; while,
+    // repeat-until, and forever loops stay on the resumable path.
+    if visiting.len() >= 64 {
+        return false;
+    }
     if !visiting.insert(procedure.definition_id.clone()) {
         return false;
     }
@@ -88,17 +150,16 @@ pub(super) fn direct_warp_eligible(
         if !seen.insert(id.to_owned()) {
             continue;
         }
+        if seen.len() > 512 {
+            eligible = false;
+            break;
+        }
         let Some(block) = target.blocks.get(id) else {
             eligible = false;
             break;
         };
         match block.opcode.as_str() {
-            "control_if"
-            | "control_if_else"
-            | "control_repeat"
-            | "control_repeat_until"
-            | "control_while"
-            | "control_forever" => {
+            "control_if" | "control_if_else" | "control_repeat" => {
                 for input in ["SUBSTACK", "SUBSTACK2"] {
                     if let Some(InputValue::BlockReference(branch)) =
                         block.inputs.get(input).and_then(parse_input)
@@ -123,7 +184,9 @@ pub(super) fn direct_warp_eligible(
             | "motion_gotoxy"
             | "pen_penDown"
             | "pen_penUp" => {}
-            // Stop is kept on the resumable path so it can propagate to the script scheduler.
+            "control_stop"
+                if field_value(block, "STOP_OPTION").and_then(Value::as_str)
+                    == Some("this script") => {}
             _ => {
                 eligible = false;
                 break;
@@ -155,6 +218,48 @@ pub(super) fn direct_warp_eligibility(
     memo
 }
 
+pub(super) fn direct_warp_contains_stop(
+    target: &ScratchTarget,
+    procedure: &ProcedureSignature,
+) -> bool {
+    let mut pending = target
+        .blocks
+        .get(&procedure.definition_id)
+        .and_then(|definition| definition.next.as_deref())
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id.to_owned()) {
+            continue;
+        }
+        let Some(block) = target.blocks.get(id) else {
+            continue;
+        };
+        if block.opcode == "control_stop"
+            && field_value(block, "STOP_OPTION").and_then(Value::as_str) == Some("this script")
+        {
+            return true;
+        }
+        if matches!(
+            block.opcode.as_str(),
+            "control_if" | "control_if_else" | "control_repeat"
+        ) {
+            for input in ["SUBSTACK", "SUBSTACK2"] {
+                if let Some(InputValue::BlockReference(branch)) =
+                    block.inputs.get(input).and_then(parse_input)
+                {
+                    pending.push(branch);
+                }
+            }
+        }
+        if let Some(next) = block.next.as_deref() {
+            pending.push(next);
+        }
+    }
+    false
+}
+
 pub(super) fn direct_name(target_index: usize, frame_id: usize) -> String {
     format!("direct_procedure_{target_index}_{frame_id}")
 }
@@ -170,13 +275,12 @@ pub(in crate::rust) fn generate_direct_procedures(
     let DirectProcedureOptions {
         target_index,
         fast_math,
-        no_warp_timer,
         reachable_procedure_ids,
         numeric_call_procedure_ids,
     } = options;
     for procedure in procedures.iter().filter(|procedure| {
         reachable_procedure_ids.contains(&procedure.definition_id)
-            && direct_eligible(target, procedure)
+            && direct_eligible(target, procedure, procedures)
     }) {
         let arguments = procedure
             .argument_names
@@ -209,10 +313,12 @@ pub(in crate::rust) fn generate_direct_procedures(
         let definition = &target.blocks[&procedure.definition_id];
         generate_direct_chain(
             target,
+            target_index,
             definition.next.as_deref(),
             variables,
             lists,
             &arguments,
+            procedures,
             output,
             1,
         );
@@ -234,61 +340,63 @@ pub(in crate::rust) fn generate_direct_procedures(
             }
         }
     }
-    if no_warp_timer {
-        let eligibility = direct_warp_eligibility(target, procedures);
-        for procedure in procedures.iter().filter(|procedure| {
-            reachable_procedure_ids.contains(&procedure.definition_id)
-                && eligibility
-                    .get(&procedure.definition_id)
-                    .copied()
-                    .unwrap_or(false)
-                && !direct_eligible(target, procedure)
-        }) {
-            let arguments = procedure
-                .argument_names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| (name.clone(), format!("argument_{index}")))
-                .collect::<HashMap<_, _>>();
-            let params = (0..procedure.argument_ids.len())
-                .map(|index| format!(", argument_{index}: ScratchValue"))
-                .collect::<String>();
-            let name = direct_warp_name(target_index, procedure.frame_id);
-            line(
-                output,
-                0,
-                "#[allow(dead_code, unused_variables, unreachable_code, unused_mut)]",
-            );
-            line(
-                output,
-                0,
-                &format!("fn {name}(state: &mut ScratchState, clock: &dyn Clock{params}) {{"),
-            );
-            let definition = &target.blocks[&procedure.definition_id];
-            generate_direct_warp_chain(
-                target,
-                target_index,
-                definition.next.as_deref(),
-                variables,
-                lists,
-                procedures,
-                &eligibility,
-                &arguments,
-                output,
-                1,
-                fast_math,
-            );
-            line(output, 0, "}\n");
-        }
+    let eligibility = direct_warp_eligibility(target, procedures);
+    for procedure in procedures.iter().filter(|procedure| {
+        reachable_procedure_ids.contains(&procedure.definition_id)
+            && eligibility
+                .get(&procedure.definition_id)
+                .copied()
+                .unwrap_or(false)
+            && (!direct_eligible(target, procedure, procedures)
+                || direct_warp_contains_stop(target, procedure))
+    }) {
+        let arguments = procedure
+            .argument_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), format!("argument_{index}")))
+            .collect::<HashMap<_, _>>();
+        let params = (0..procedure.argument_ids.len())
+            .map(|index| format!(", argument_{index}: ScratchValue"))
+            .collect::<String>();
+        let name = direct_warp_name(target_index, procedure.frame_id);
+        line(
+            output,
+            0,
+            "#[allow(dead_code, unused_variables, unreachable_code, unused_mut)]",
+        );
+        line(
+            output,
+            0,
+            &format!("fn {name}(state: &mut ScratchState, clock: &dyn Clock{params}) -> bool {{"),
+        );
+        let definition = &target.blocks[&procedure.definition_id];
+        generate_direct_warp_chain(
+            target,
+            target_index,
+            definition.next.as_deref(),
+            variables,
+            lists,
+            procedures,
+            &eligibility,
+            &arguments,
+            output,
+            1,
+            fast_math,
+        );
+        line(output, 1, "true");
+        line(output, 0, "}\n");
     }
 }
 
 pub(super) fn generate_direct_chain<'a>(
     target: &'a ScratchTarget,
+    target_index: usize,
     mut id: Option<&'a str>,
     variables: &HashMap<String, VariableInfo>,
     lists: &HashMap<String, ListInfo>,
     arguments: &HashMap<String, String>,
+    procedures: &[ProcedureSignature],
     output: &mut String,
     indent: usize,
 ) {
@@ -318,10 +426,12 @@ pub(super) fn generate_direct_chain<'a>(
                 };
                 generate_direct_chain(
                     target,
+                    target_index,
                     branch("SUBSTACK"),
                     variables,
                     lists,
                     arguments,
+                    procedures,
                     output,
                     indent + 1,
                 );
@@ -329,10 +439,12 @@ pub(super) fn generate_direct_chain<'a>(
                     line(output, indent, "} else {");
                     generate_direct_chain(
                         target,
+                        target_index,
                         branch("SUBSTACK2"),
                         variables,
                         lists,
                         arguments,
+                        procedures,
                         output,
                         indent + 1,
                     );
@@ -340,6 +452,46 @@ pub(super) fn generate_direct_chain<'a>(
                 line(output, indent, "}");
             }
             "control_stop" => line(output, indent, "return;"),
+            "procedures_call" => {
+                let Some(callee) = procedure_for_call(block, procedures) else {
+                    line(
+                        output,
+                        indent,
+                        "unreachable!(\"direct procedure call was not resolved\");",
+                    );
+                    id = block.next.as_deref();
+                    continue;
+                };
+                debug_assert!(direct_call_eligible(target, callee, procedures));
+                let values = callee
+                    .argument_ids
+                    .iter()
+                    .map(|argument_id| {
+                        expression(
+                            target,
+                            block.inputs.get(argument_id),
+                            variables,
+                            lists,
+                            arguments,
+                            &mut HashSet::new(),
+                        )
+                    })
+                    .map(|value| format!("({value}).to_owned().into()"))
+                    .collect::<Vec<_>>();
+                let args = if values.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", values.join(", "))
+                };
+                line(
+                    output,
+                    indent,
+                    &format!(
+                        "{}(state, clock{args});",
+                        direct_name(target_index, callee.frame_id)
+                    ),
+                );
+            }
             "data_setvariableto"
                 if variable_field(block, "VARIABLE", variables)
                     .is_some_and(|variable| !variable.is_stage && !variable.numeric) =>
@@ -563,6 +715,7 @@ pub(super) fn generate_direct_warp_chain<'a>(
                     }
                 }
             }
+            "control_stop" => line(output, indent, "return false;"),
             "procedures_call" => {
                 let Some(callee) = procedure_for_call(block, procedures) else {
                     line(
@@ -599,16 +752,25 @@ pub(super) fn generate_direct_warp_chain<'a>(
                 } else {
                     format!(", {}", values.join(", "))
                 };
-                let callee_name = if direct_eligible(target, callee) {
+                let callee_stops = direct_warp_contains_stop(target, callee);
+                let callee_name = if direct_eligible(target, callee, procedures) && !callee_stops {
                     direct_name(target_index, callee.frame_id)
                 } else {
                     direct_warp_name(target_index, callee.frame_id)
                 };
-                line(
-                    output,
-                    indent,
-                    &format!("{callee_name}(state, clock{args});"),
-                );
+                if callee_name.starts_with("direct_warp_procedure_") {
+                    line(
+                        output,
+                        indent,
+                        &format!("if !{callee_name}(state, clock{args}) {{ return false; }}"),
+                    );
+                } else {
+                    line(
+                        output,
+                        indent,
+                        &format!("{callee_name}(state, clock{args});"),
+                    );
+                }
             }
             _ => generate_resumable_statement(
                 StatementContext {
@@ -646,11 +808,12 @@ pub(super) fn generate_direct_numeric_loop(
             output,
             indent,
             &format!(
-                "let mut scratch_local_{slot} = scratch_to_number({});",
+                "let mut scratch_local_{slot} = {};",
                 variable_read_for_slot(variables, *slot)
             ),
         );
     }
+    emit_numeric_stability_flags(plan, output, indent);
     match block.opcode.as_str() {
         "control_repeat" => {
             let times = local_expression(
@@ -677,6 +840,7 @@ pub(super) fn generate_direct_numeric_loop(
                 plan,
                 &locals,
                 fast_math,
+                None,
                 output,
                 indent + 1,
             );
@@ -709,6 +873,7 @@ pub(super) fn generate_direct_numeric_loop(
                 plan,
                 &locals,
                 fast_math,
+                None,
                 output,
                 indent + 1,
             );

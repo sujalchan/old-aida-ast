@@ -113,14 +113,14 @@ fn numeric_loops_use_native_locals_and_commit_before_safeguard_yields() {
         .unwrap();
 
     let output = generate(&project);
-    assert!(output.contains("let mut scratch_local_0 = scratch_to_number(state.get(0));"));
+    assert!(output.contains("let mut scratch_local_0 = state.get_number(0);"));
     assert!(output.contains("scratch_local_0 += 1.0_f64;"));
     assert!(!output.contains("scratch_equals(\"same\", \"same\")"));
     let safeguard = output
         .find("if !scratch_warp_mode || script.warp_budget.expired(clock)")
         .unwrap();
     let commit = output[safeguard..]
-        .find("state.set(0, scratch_local_0.into());")
+        .find("state.set_local_number(0, scratch_local_0);")
         .unwrap()
         + safeguard;
     let yielded = output[commit..]
@@ -168,7 +168,16 @@ fn fast_math_only_changes_proven_numeric_loop_expressions() {
     let fast = super::generate_with_options(&project, true);
 
     assert!(compatible.contains("scratch_number_operand(scratch_local_0)"));
-    assert!(compatible.contains("scratch_sin("));
+    assert!(compatible.contains("scratch_sin_number("));
+    assert!(compatible.contains("repeat_counts[0] & (1usize << 0) != 0"));
+    assert!(compatible.contains("repeat_counts[0] |= 1usize << 0"));
+    assert!(compatible.contains(
+        "let scratch_batch = script.warp_budget.safe_points_until_check();"
+    ));
+    assert!(compatible.contains(
+        "script.warp_budget.expired_after_safe_points(clock, scratch_batch)"
+    ));
+    assert!(compatible.contains("let scratch_batch = 1024usize;"));
     assert!(!compatible.contains("fast_sin("));
     assert!(fast.contains("fast_sin("));
     assert!(fast.contains("fast_cos("));

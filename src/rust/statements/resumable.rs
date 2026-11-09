@@ -421,7 +421,6 @@ pub(in crate::rust) fn prepare_resumable_procedures(
     lists: &HashMap<String, ListInfo>,
     procedures: &[ProcedureSignature],
     target_index: usize,
-    no_warp_timer: bool,
 ) -> ResumableProcedurePlan {
     let calls_in = |graph: &ScriptGraph, call_block_ids: &mut HashSet<String>| {
         graph
@@ -462,11 +461,7 @@ pub(in crate::rust) fn prepare_resumable_procedures(
         }
     }
 
-    let direct_warp_eligibility = if no_warp_timer {
-        direct_warp_eligibility(target, procedures)
-    } else {
-        HashMap::new()
-    };
+    let direct_warp_eligibility = direct_warp_eligibility(target, procedures);
     let mut graphs = Vec::new();
     let mut entries = HashMap::new();
     for procedure in procedures
@@ -483,11 +478,11 @@ pub(in crate::rust) fn prepare_resumable_procedures(
             .as_deref()
             .and_then(|id| graph.block_pcs.get(id).copied())
             .unwrap_or(usize::MAX);
-        let direct_path_name = direct_eligible(target, procedure)
+        let direct_path_name = direct_eligible(target, procedure, procedures)
             .then(|| direct_name(target_index, procedure.frame_id));
         let direct_path_is_none = direct_path_name.is_none();
-        let direct_warp_path = (no_warp_timer
-            && direct_path_is_none
+        let direct_warp_path = ((direct_path_is_none
+            || direct_warp_contains_stop(target, procedure))
             && direct_warp_eligibility
                 .get(&procedure.definition_id)
                 .copied()
@@ -508,7 +503,7 @@ pub(in crate::rust) fn prepare_resumable_procedures(
             ProcedureEntry {
                 function_id: procedure.frame_id,
                 start_pc,
-                repeat_count: graph.repeat_slots.len(),
+                repeat_count: graph.frame_state_count(),
                 direct_name: direct_path_name,
                 direct_warp_name: direct_warp_path,
                 numeric_direct,
@@ -815,7 +810,7 @@ pub(in crate::rust) fn generate_resumable_script(
             emit_partition_worker(function_name, partition, partition.function_id != 0, output);
         }
     }
-    (start_pc, graph.repeat_slots.len())
+    (start_pc, graph.frame_state_count())
 }
 
 fn structured_repeat_body(
@@ -1381,6 +1376,10 @@ pub(super) fn generate_warp_repeat_list_append(
                     .and_then(|block| constant_random_bounds(target, block)),
                 _ => None,
             });
+    let numeric_random_is_finite = numeric_random.is_some_and(|(from, to, _)| {
+        let (low, high) = if from <= to { (from, to) } else { (to, from) };
+        (high - low).is_finite()
+    });
 
     line(
         output,
@@ -1397,87 +1396,175 @@ pub(super) fn generate_warp_repeat_list_append(
         indent + 2,
         &format!("script.frames.last_mut().unwrap().repeat_counts[{repeat_slot}] = repeat_count;"),
     );
-    line(
-        output,
-        indent + 2,
-        "let mut repeat_remaining = repeat_count;",
-    );
-    line(output, indent + 2, "while repeat_remaining > 0 {");
-    line(
-        output,
-        indent + 3,
-        "let repeat_chunk = repeat_remaining.min(1024);",
-    );
-    line(output, indent + 3, "let mut scratch_list_changed = false;");
-    if item_reads_state {
-        line(output, indent + 3, "for _ in 0..repeat_chunk {");
+    if !item_reads_state && let Some((from, to, integer_bounds)) = numeric_random {
+        let append_method = if numeric_random_is_finite {
+            "add_finite_numbers"
+        } else {
+            "add_numbers"
+        };
+        line(output, indent + 2, "let mut scratch_list_changed = false;");
         line(
             output,
-            indent + 4,
-            &format!("let scratch_list_item: ScratchValue = {item};"),
+            indent + 2,
+            "let yielded_repeat = with_scratch_random(|scratch_rng| {",
         );
-        line(
-            output,
-            indent + 4,
-            &format!(
-                "scratch_list_changed |= state.list_mut({}).add(scratch_list_item);",
-                list.slot
-            ),
-        );
-        line(output, indent + 3, "}");
-    } else if let Some((from, to, integer_bounds)) = numeric_random {
         line(
             output,
             indent + 3,
             &format!(
-                "scratch_list_changed = with_scratch_random(|scratch_rng| state.list_mut({}).add_generated_numbers(repeat_chunk, || scratch_rng.between_with_integer_bounds({from:?}_f64, {to:?}_f64, {integer_bounds})));",
+                "state.list_mut({}).with_generated_finite_number_appender(repeat_count, |scratch_list_append| {{",
+                list.slot
+            ),
+        );
+        line(
+            output,
+            indent + 4,
+            "let mut repeat_remaining = repeat_count;",
+        );
+        line(output, indent + 4, "while repeat_remaining > 0 {");
+        line(
+            output,
+            indent + 5,
+            "let repeat_chunk = repeat_remaining.min(1024);",
+        );
+        line(
+            output,
+            indent + 5,
+            &format!(
+                "scratch_list_changed |= scratch_list_append.{append_method}(repeat_chunk, || scratch_rng.between_with_integer_bounds({from:?}_f64, {to:?}_f64, {integer_bounds}));"
+            ),
+        );
+        line(output, indent + 5, "repeat_remaining -= repeat_chunk;");
+        if !no_warp_timer {
+            line(
+                output,
+                indent + 5,
+                "if script.warp_budget.expired_now(clock) {",
+            );
+            line(output, indent + 6, "return Some(repeat_remaining);");
+            line(output, indent + 5, "}");
+        }
+        line(output, indent + 4, "}");
+        line(output, indent + 4, "None");
+        line(output, indent + 3, "})");
+        line(output, indent + 2, "});");
+        line(
+            output,
+            indent + 2,
+            "if let Some(repeat_remaining) = yielded_repeat {",
+        );
+        line(
+            output,
+            indent + 3,
+            &format!(
+                "script.frames.last_mut().unwrap().repeat_counts[{repeat_slot}] = repeat_remaining;"
+            ),
+        );
+        line(
+            output,
+            indent + 3,
+            &format!(
+                "script.frames.last_mut().unwrap().pc = if repeat_remaining > 0 {{ {body_pc} }} else {{ {} }};",
+                pc_literal(next_pc)
+            ),
+        );
+        line(
+            output,
+            indent + 3,
+            &format!(
+                "state.list_changed_result({}, scratch_list_changed);",
+                list.slot
+            ),
+        );
+        line(output, indent + 3, "return ScriptStatus::Yield;");
+        line(output, indent + 2, "}");
+        line(
+            output,
+            indent + 2,
+            &format!("script.frames.last_mut().unwrap().repeat_counts[{repeat_slot}] = 0;"),
+        );
+        line(
+            output,
+            indent + 2,
+            &format!(
+                "state.list_changed_result({}, scratch_list_changed);",
                 list.slot
             ),
         );
     } else {
         line(
             output,
+            indent + 2,
+            "let mut repeat_remaining = repeat_count;",
+        );
+        line(output, indent + 2, "while repeat_remaining > 0 {");
+        line(
+            output,
+            indent + 3,
+            "let repeat_chunk = repeat_remaining.min(1024);",
+        );
+        line(output, indent + 3, "let mut scratch_list_changed = false;");
+        if item_reads_state {
+            line(output, indent + 3, "for _ in 0..repeat_chunk {");
+            line(
+                output,
+                indent + 4,
+                &format!("let scratch_list_item: ScratchValue = {item};"),
+            );
+            line(
+                output,
+                indent + 4,
+                &format!(
+                    "scratch_list_changed |= state.list_mut({}).add(scratch_list_item);",
+                    list.slot
+                ),
+            );
+            line(output, indent + 3, "}");
+        } else {
+            line(
+                output,
+                indent + 3,
+                &format!(
+                    "scratch_list_changed = state.list_mut({}).add_generated(repeat_chunk, || {{ let scratch_list_item: ScratchValue = {item}; scratch_list_item }});",
+                    list.slot
+                ),
+            );
+        }
+        line(output, indent + 3, "repeat_remaining -= repeat_chunk;");
+        line(
+            output,
             indent + 3,
             &format!(
-                "scratch_list_changed = state.list_mut({}).add_generated(repeat_chunk, || {{ let scratch_list_item: ScratchValue = {item}; scratch_list_item }});",
+                "script.frames.last_mut().unwrap().repeat_counts[{repeat_slot}] = repeat_remaining;"
+            ),
+        );
+        line(
+            output,
+            indent + 3,
+            &format!(
+                "state.list_changed_result({}, scratch_list_changed);",
                 list.slot
             ),
         );
+        if !no_warp_timer {
+            line(
+                output,
+                indent + 3,
+                "if script.warp_budget.expired_now(clock) {",
+            );
+            line(
+                output,
+                indent + 4,
+                &format!(
+                    "script.frames.last_mut().unwrap().pc = if repeat_remaining > 0 {{ {body_pc} }} else {{ {} }};",
+                    pc_literal(next_pc)
+                ),
+            );
+            line(output, indent + 4, "return ScriptStatus::Yield;");
+            line(output, indent + 3, "}");
+        }
+        line(output, indent + 2, "}");
     }
-    line(output, indent + 3, "repeat_remaining -= repeat_chunk;");
-    line(
-        output,
-        indent + 3,
-        &format!(
-            "script.frames.last_mut().unwrap().repeat_counts[{repeat_slot}] = repeat_remaining;"
-        ),
-    );
-    line(
-        output,
-        indent + 3,
-        &format!(
-            "state.list_changed_result({}, scratch_list_changed);",
-            list.slot
-        ),
-    );
-    if !no_warp_timer {
-        line(
-            output,
-            indent + 3,
-            "if script.warp_budget.expired_now(clock) {",
-        );
-        line(
-            output,
-            indent + 4,
-            &format!(
-                "script.frames.last_mut().unwrap().pc = if repeat_remaining > 0 {{ {body_pc} }} else {{ {} }};",
-                pc_literal(next_pc)
-            ),
-        );
-        line(output, indent + 4, "return ScriptStatus::Yield;");
-        line(output, indent + 3, "}");
-    }
-    line(output, indent + 2, "}");
     line(
         output,
         indent + 2,
@@ -1954,7 +2041,7 @@ fn generate_resumable_block_chain(
             );
             line(output, level, "let mut scratch_region_escaped = false;");
             line(output, level, "'scratch_compiled_loop: loop {");
-            emit_partial_structured_chain(
+            let partial_outcome = emit_partial_structured_chain(
                 target,
                 Some(id),
                 graph,
@@ -1969,6 +2056,7 @@ fn generate_resumable_block_chain(
                 procedure_entries,
                 no_warp_timer,
                 Some(repeat_slot),
+                true,
                 output,
                 level + 1,
             );
@@ -2006,7 +2094,7 @@ fn generate_resumable_block_chain(
                     pc_literal(next_pc)
                 ),
             );
-            if typed {
+            if typed && !partial_outcome.deferred_flushed {
                 emit_deferred_numeric_commits(output, level + 2, &numeric, &deferred, &textual);
             }
             line(output, level + 2, "return ScriptStatus::Yield;");
@@ -2028,8 +2116,10 @@ fn generate_resumable_block_chain(
                     pc_literal(next_pc)
                 ),
             );
-            if typed {
+            if typed && !partial_outcome.deferred_flushed {
                 emit_deferred_numeric_commits(output, level, &numeric, &deferred, &textual);
+                line(output, 5, "} else {");
+            } else if typed {
                 line(output, 5, "} else {");
             }
         }
@@ -2161,7 +2251,7 @@ fn generate_resumable_block_chain(
             let level = if numeric.is_empty() { 5 } else { 6 };
             line(output, level, "let mut scratch_region_escaped = false;");
             let mut region_output = String::new();
-            let requires_escape_label = emit_partial_structured_chain(
+            let partial_outcome = emit_partial_structured_chain(
                 target,
                 Some(id),
                 graph,
@@ -2176,13 +2266,14 @@ fn generate_resumable_block_chain(
                 procedure_entries,
                 no_warp_timer,
                 None,
+                true,
                 &mut region_output,
                 level + 1,
             );
             line(
                 output,
                 level,
-                if requires_escape_label {
+                if partial_outcome.requires_escape_label {
                     "'scratch_compiled_loop: {"
                 } else {
                     "{"
@@ -2190,7 +2281,7 @@ fn generate_resumable_block_chain(
             );
             output.push_str(&region_output);
             line(output, level, "}");
-            if typed {
+            if typed && !partial_outcome.deferred_flushed {
                 emit_deferred_numeric_commits(output, level, &numeric, &deferred, &textual);
             }
             line(
@@ -2265,14 +2356,7 @@ fn generate_resumable_block_chain(
             line(
                 output,
                 6,
-                &format!("let mut scratch_typed_{} = 0.0_f64;", variable.slot),
-            );
-        }
-        for variable in numeric.iter().filter(|v| deferred.contains(&v.slot)) {
-            line(
-                output,
-                6,
-                &format!("let mut scratch_dirty_{} = false;", variable.slot),
+                &format!("let mut scratch_typed_{};", variable.slot),
             );
         }
         for typed in [true, false] {
@@ -2291,6 +2375,7 @@ fn generate_resumable_block_chain(
                                 arguments,
                                 deferred: &deferred,
                                 textual: &HashSet::new(),
+                                dirty_tracking: false,
                             },
                             statement,
                             &variable,
@@ -2315,7 +2400,7 @@ fn generate_resumable_block_chain(
                             output,
                             6,
                             &format!(
-                                "scratch_typed_{0} = scratch_number_operand(scratch_typed_{0}) + scratch_change; scratch_dirty_{0} = true;",
+                                "scratch_typed_{0} = scratch_number_operand(scratch_typed_{0}) + scratch_change;",
                                 variable.slot
                             ),
                         );
@@ -2336,7 +2421,7 @@ fn generate_resumable_block_chain(
                 }
             }
             if typed {
-                emit_deferred_numeric_commits(output, 6, &numeric, &deferred, &HashSet::new());
+                emit_definite_numeric_commits(output, 6, &numeric, &deferred);
                 line(output, 5, "} else {");
             }
         }

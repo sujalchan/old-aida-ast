@@ -53,7 +53,7 @@ fn stop_loop_fixture_lowers_this_script_inside_a_custom_block_and_stop_all() {
     let project = parse_project(&json).unwrap();
     let output = generate(&project);
 
-    assert!(output.contains("if script.frames.len() > 1 { script.frames.pop(); continue; }"));
+    assert!(output.contains("if script.frames.len() > 1 { script.pop_frame(); continue; }"));
     assert!(output.contains("return ScriptStatus::StopAll;"));
     assert!(!output.contains("unsupported statement: control_stop"));
 }
@@ -116,6 +116,60 @@ fn if_else_fixture_lowers_conditional_branches() {
     assert!(output.contains("} else {"));
     assert!(!output.contains("unsupported statement: control_if"));
     assert!(!output.contains("unsupported statement: control_if_else"));
+    assert!(!output.contains("fn push_frame("));
+    assert!(!output.contains("fn pop_frame("));
+}
+
+#[test]
+fn engine_nested_procedure_branches_hoist_the_common_numeric_flush() {
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/programs/engine-from-nowhere.sb3"
+    );
+    let json = crate::extractor::read_project_json(input).unwrap();
+    let project = parse_project(&json).unwrap();
+    let output = generate(&project);
+    let slots = [
+        9, 12, 13, 15, 17, 22, 23, 31, 34, 51, 57, 61, 65, 68, 75, 78, 89, 97, 99, 120, 128, 129,
+        148,
+    ];
+    let lines = output.lines().collect::<Vec<_>>();
+    let matching_flushes = lines
+        .windows(slots.len())
+        .enumerate()
+        .filter_map(|(start, window)| {
+            slots
+                .iter()
+                .enumerate()
+                .all(|(index, slot)| {
+                    window[index].trim()
+                        == format!(
+                            "if scratch_dirty_{slot} {{ state.set_local_number({slot}, scratch_typed_{slot}); }}"
+                        )
+                })
+                .then_some(start)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching_flushes.len(), 1);
+    let flush_start = matching_flushes[0];
+    assert!(slots.iter().all(|slot| {
+        !lines[flush_start..flush_start + slots.len()]
+            .iter()
+            .any(|line| line.contains(&format!("scratch_dirty_{slot} = false;")))
+    }));
+    let condition_line = lines
+        .iter()
+        .position(|line| {
+            line.contains("let scratch_branch_condition_") && line.contains("scratch_typed_127")
+        })
+        .expect("the branch condition is evaluated before the shared flush");
+    assert!(condition_line < flush_start);
+    assert!(
+        lines[flush_start + slots.len()]
+            .trim()
+            .starts_with("if scratch_branch_condition_")
+    );
 }
 
 #[test]
@@ -174,7 +228,7 @@ fn loop_body_keeps_states_needed_after_a_warp_call_yields() {
     let output = generate(&project);
 
     assert!(output.contains("fn direct_procedure_"));
-    assert!(output.contains("script.frames.push(ProcedureFrame::new("));
+    assert!(output.contains("script.push_frame("));
     assert!(output.contains("repeat_counts["));
     assert!(count_resumable_pc_arms(&output) >= 4);
 }
@@ -204,7 +258,7 @@ fn straight_line_blocks_share_one_resumable_dispatch_arm() {
     assert!(output.contains("state.set_local_number(1, 2.0_f64);"));
     assert!(!output.contains("__aida_set_pc!(script, 1);"));
     assert!(output.contains("__aida_continue_at!(script, usize::MAX);"));
-    assert!(output.contains("fn frame(&self) -> &ProcedureFrame"));
+    assert!(!output.contains("fn frame(&self) -> &ProcedureFrame"));
     assert!(output.contains("fn frame_mut(&mut self) -> &mut ProcedureFrame"));
     assert!(!output.contains("script.frames.last().unwrap()"));
     assert!(!output.contains("script.frames.last_mut().unwrap()"));
@@ -284,7 +338,7 @@ fn lowers_nested_repeat_until_and_forever_with_resumable_loop_state() {
         .unwrap();
 
     let output = generate(&project);
-    assert!(output.contains("vec![0; 2]"));
+    assert!(output.contains("vec![0; 6]"));
     assert!(output.contains("script.frame_mut().repeat_counts[0] = repeat_count;"));
     assert!(output.contains("script.frame_mut().repeat_counts[1] = repeat_count;"));
     assert_eq!(
@@ -336,6 +390,50 @@ fn structured_loop_merges_nested_numeric_branches_and_commits_before_yield() {
         "dynamic fallback must remain"
     );
     assert_eq!(count_resumable_pc_arms(&output), 2);
+}
+
+#[test]
+fn straight_numeric_region_commits_definite_writes_without_dirty_flags() {
+    let mut blocks = json!({
+        "hat": {"opcode":"event_whenflagclicked", "next":"set0", "topLevel":true, "inputs":{}, "fields":{}}
+    });
+    for index in 0..4 {
+        blocks.as_object_mut().unwrap().insert(
+            format!("set{index}"),
+            json!({
+                "opcode":"data_changevariableby",
+                "next":(index < 3).then(|| format!("set{}", index + 1)),
+                "parent":if index == 0 {"hat"} else {"previous"},
+                "inputs":{"VALUE":[1,[4,"1"]]},
+                "fields":{"VARIABLE":["counter","counter_id"]}
+            }),
+        );
+        if index > 0 {
+            blocks[format!("set{index}")]["parent"] = json!(format!("set{}", index - 1));
+        }
+    }
+    let project = parse_project(
+        &json!({
+            "targets": [{
+                "name":"Sprite1",
+                "isStage":false,
+                "variables":{"counter_id":["counter", 0]},
+                "blocks":blocks
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = generate(&project);
+    assert!(!output.contains("scratch_dirty_0"));
+    assert!(output.contains("state.set_local_number(0, scratch_typed_0);"));
+    assert_eq!(
+        output
+            .matches("scratch_typed_0 = scratch_number_operand(scratch_typed_0) + scratch_change;")
+            .count(),
+        4
+    );
 }
 
 fn count_resumable_pc_arms(source: &str) -> usize {

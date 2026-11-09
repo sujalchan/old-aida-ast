@@ -56,6 +56,29 @@ pub(super) fn rust_identifiers(source: &str) -> HashSet<String> {
 pub(super) fn allocate_variables(project: &ScratchProject) -> HashMap<String, VariableInfo> {
     let numeric_variables = numeric_variables(project);
     let non_nan_variables = non_nan_variables(project);
+    let mut writer_counts = HashMap::<String, usize>::new();
+    for target in &project.targets {
+        for block in target.blocks.values() {
+            if !matches!(
+                block.opcode.as_str(),
+                "data_setvariableto" | "data_changevariableby"
+            ) {
+                continue;
+            }
+            let Some(id) = block
+                .fields
+                .get("VARIABLE")
+                .and_then(|field| field.as_array())
+                .and_then(|field| field.get(1))
+                .and_then(|id| id.as_str())
+            else {
+                continue;
+            };
+            *writer_counts
+                .entry(variable_key_for_target(target, id))
+                .or_default() += 1;
+        }
+    }
     let mut entries = BTreeMap::new();
     for (target_index, target) in project.targets.iter().enumerate() {
         let mut variable_ids = target.variable_order.clone();
@@ -89,6 +112,10 @@ pub(super) fn allocate_variables(project: &ScratchProject) -> HashMap<String, Va
                     target_variable_order,
                     numeric: numeric_variables.contains(&variable_key(target_index, id)),
                     non_nan: non_nan_variables.contains(&variable_key(target_index, id)),
+                    writer_count: writer_counts
+                        .get(&variable_key(target_index, id))
+                        .copied()
+                        .unwrap_or(0),
                     monitor_visible,
                     index_read_override: None,
                 },

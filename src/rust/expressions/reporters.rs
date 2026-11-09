@@ -286,7 +286,13 @@ pub(super) fn block_expression(
             format!("state.backdrop_number_name({number})")
         }
         "data_itemoflist" => list_field(block, "LIST", lists)
-            .map(|list| format!("state.list({}).get({})", list.slot, input("INDEX", active)))
+            .map(|list| {
+                format!(
+                    "state.list({}).get_value({})",
+                    list.slot,
+                    input("INDEX", active)
+                )
+            })
             .unwrap_or_else(|| unsupported_expression("missing list reference")),
         // forward dropdown selectors unchanged; list operations resolve them when used.
         "data_listindexall" | "data_listindexrandom" => field_value(block, "INDEX")
@@ -517,13 +523,12 @@ pub(super) fn comparison_input_is_value_ref(
             )
         }
         Some(InputValue::BlockReference(id)) => target.blocks.get(id).is_some_and(|b| {
-            b.opcode == "data_itemoflist"
-                || (b.opcode == "data_variable"
-                    && variable_field(b, "VARIABLE", variables).is_some_and(|v| {
-                        v.index_read_override
-                            .as_deref()
-                            .is_none_or(|s| s.starts_with("&scratch_dynamic_"))
-                    }))
+            b.opcode == "data_variable"
+                && variable_field(b, "VARIABLE", variables).is_some_and(|v| {
+                    v.index_read_override
+                        .as_deref()
+                        .is_none_or(|s| s.starts_with("&scratch_dynamic_"))
+                })
         }),
         _ => false,
     }

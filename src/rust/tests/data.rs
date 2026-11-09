@@ -168,7 +168,7 @@ fn list_index_dropdowns_flow_into_list_mutations_and_item_reporters() {
     assert!(output.contains("let scratch_list_index: ScratchValue = (\"all\").into();"));
     assert!(output.contains("let scratch_list_index: ScratchValue = (\"random\").into();"));
     assert!(output.contains("let scratch_list_index: ScratchValue = (\"last\").into();"));
-    assert!(output.contains("state.list(0).get(\"last\")"));
+    assert!(output.contains("state.list(0).get_value(\"last\")"));
     assert!(
         output.contains("let scratch_list_changed = state.list_mut(0).delete(scratch_list_index);")
     );
@@ -245,7 +245,8 @@ fn list_smoke_warp_append_loop_is_fused_with_watchdog_chunks() {
     let project = parse_project(&json).unwrap();
     let output = generate(&project);
 
-    assert!(output.contains("add_generated_numbers(repeat_chunk"));
+    assert!(output.contains("with_generated_finite_number_appender(repeat_count"));
+    assert!(output.contains("scratch_list_append.add_finite_numbers(repeat_chunk"));
     assert!(output.contains("with_scratch_random(|scratch_rng|"));
     assert!(output.contains("between_with_integer_bounds(11.0_f64, 20.0_f64, true)"));
     assert!(output.contains("scratch_random_constant(11.0_f64, 20.0_f64, true)"));

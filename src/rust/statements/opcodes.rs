@@ -1190,7 +1190,7 @@ pub(super) fn variable_input(
                     arguments,
                     &mut HashSet::new(),
                 );
-                Some(format!("state.list({}).get({index})", list.slot))
+                Some(format!("state.list({}).get_value({index})", list.slot))
             } else {
                 None
             }

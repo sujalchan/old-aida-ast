@@ -94,10 +94,12 @@ pub(super) fn generate_green_flag_functions(
     };
     let glide_initializer = if uses_glide { ", glide: None" } else { "" };
     output.push_str(&format!(
-        "#[allow(dead_code)]\nstruct ProcedureFrame {{ function: usize, pc: usize, repeat_counts: Vec<usize>, arguments: Vec<ScratchValue>, warp_mode: bool{glide_field} }}\nimpl ProcedureFrame {{ fn new(function: usize, pc: usize, repeat_counts: Vec<usize>, arguments: Vec<ScratchValue>, warp_mode: bool) -> Self {{ Self {{ function, pc, repeat_counts, arguments, warp_mode{glide_initializer} }} }} }}\n"
+        "#[allow(dead_code)]\nstruct ProcedureFrame {{ function: usize, pc: usize, repeat_counts: Vec<usize>, numeric_loop_values: Vec<f64>, arguments: Vec<ScratchValue>, warp_mode: bool{glide_field} }}\nimpl ProcedureFrame {{ fn new(function: usize, pc: usize, repeat_counts: Vec<usize>, arguments: Vec<ScratchValue>, warp_mode: bool) -> Self {{ let numeric_loop_values = vec![0.0; repeat_counts.len()]; Self {{ function, pc, repeat_counts, numeric_loop_values, arguments, warp_mode{glide_initializer} }} }} }}\n"
     ));
-    output
-        .push_str("struct ScriptState { frames: Vec<ProcedureFrame>, __WARP_BUDGET_FIELD__ }\n\n");
+    output.push_str(
+        "#[allow(dead_code)]\n#[derive(Default)]\nstruct ProcedureFrameStorage { repeat_counts: Vec<usize>, numeric_loop_values: Vec<f64>, arguments: Vec<ScratchValue> }\n\n",
+    );
+    output.push_str("struct ScriptState { frames: Vec<ProcedureFrame>, #[allow(dead_code)] frame_pool: Vec<ProcedureFrameStorage>, __WARP_BUDGET_FIELD__ }\n\n");
     line(output, 0, "enum GeneratedScript {");
     for script in &scripts {
         line(
@@ -227,7 +229,6 @@ pub(super) fn generate_green_flag_functions(
             lists,
             &procedures,
             script.target_index,
-            no_warp_timer,
         );
         procedures_by_target.insert(script.target_index, procedures);
         procedure_plans.insert(script.target_index, plan);
@@ -301,7 +302,6 @@ pub(super) fn generate_green_flag_functions(
                 lists,
                 procedures,
                 candidate.target_index,
-                no_warp_timer,
             );
             let mut source = String::new();
             let (start_pc, loop_count) = generate_resumable_script(
@@ -385,7 +385,6 @@ pub(super) fn generate_green_flag_functions(
                 DirectProcedureOptions {
                     target_index: script.target_index,
                     fast_math,
-                    no_warp_timer,
                     reachable_procedure_ids: procedure_plan.reachable_ids().clone(),
                     numeric_call_procedure_ids: procedure_plan.numeric_call_procedure_ids().clone(),
                 },
@@ -403,7 +402,7 @@ pub(super) fn generate_green_flag_functions(
             output,
             0,
             &format!(
-                "fn new_{}_for(instance: usize) -> GeneratedScript {{ GeneratedScript::{}(instance, ScriptState {{ frames: vec![ProcedureFrame::new(0, {}, vec![0; {loop_count}], vec![], false)], __WARP_BUDGET_INIT__ }}) }}\n",
+                "fn new_{}_for(instance: usize) -> GeneratedScript {{ GeneratedScript::{}(instance, ScriptState {{ frames: vec![ProcedureFrame::new(0, {}, vec![0; {loop_count}], vec![], false)], frame_pool: Vec::new(), __WARP_BUDGET_INIT__ }}) }}\n",
                 script.function,
                 script.variant,
                 if start_pc == usize::MAX {
@@ -422,10 +421,7 @@ pub(super) fn generate_green_flag_functions(
                     script.function, script.function, script.target_index
                 ),
             );
-        } else if matches!(
-            script.hat.opcode.as_str(),
-            "control_start_as_clone" | "event_whenkeypressed"
-        ) {
+        } else if script.hat.opcode == "control_start_as_clone" {
             line(
                 output,
                 0,
@@ -447,6 +443,18 @@ pub(super) fn generate_scripts(
     uses_clones: bool,
     output: &mut String,
 ) {
+    let glide_initializer = if project.targets.iter().any(|target| {
+        target.blocks.values().any(|block| {
+            matches!(
+                block.opcode.as_str(),
+                "motion_glideto" | "motion_glidesecstoxy"
+            )
+        })
+    }) {
+        ", glide: None"
+    } else {
+        ""
+    };
     let scripts = event_scripts(project, variables, lists);
     let values = scripts
         .iter()
@@ -633,15 +641,29 @@ pub(super) fn generate_scripts(
         .replace("__WARP_BUDGET_INIT__", budget_init);
 
     let mut helpers = Vec::new();
+    if output.contains("script.push_frame(") {
+        helpers.push(
+            "    fn push_frame(&mut self, function: usize, pc: usize, repeat_count: usize, arguments: impl IntoIterator<Item = ScratchValue>, warp_mode: bool) {\n        let mut storage = self.frame_pool.pop().unwrap_or_default();\n        storage.repeat_counts.resize(repeat_count, 0);\n        storage.repeat_counts.fill(0);\n        storage.numeric_loop_values.resize(repeat_count, 0.0);\n        storage.numeric_loop_values.fill(0.0);\n        storage.arguments.clear();\n        storage.arguments.extend(arguments);\n        self.frames.push(ProcedureFrame { function, pc, repeat_counts: storage.repeat_counts, numeric_loop_values: storage.numeric_loop_values, arguments: storage.arguments, warp_mode__GLIDE_FIELD__ });\n    }"
+                .replace("__GLIDE_FIELD__", glide_initializer),
+        );
+    }
+    if output.contains("script.frames.pop();") || output.contains("script.pop_frame();") {
+        helpers.push(
+            "    fn pop_frame(&mut self) {\n        if let Some(frame) = self.frames.pop() {\n            self.frame_pool.push(ProcedureFrameStorage { repeat_counts: frame.repeat_counts, numeric_loop_values: frame.numeric_loop_values, arguments: frame.arguments });\n        }\n    }"
+                .to_owned(),
+        );
+    }
     if uses_warp_budget_expired {
-        helpers.push("    fn warp_budget_expired(&mut self, clock: &dyn Clock) -> bool {\n        if !self.frames.last().is_some_and(|frame| frame.warp_mode) { self.warp_budget.reset(); return false; }\n        self.warp_budget.expired(clock)\n    }");
+        helpers.push("    fn warp_budget_expired(&mut self, clock: &dyn Clock) -> bool {\n        if !self.frames.last().is_some_and(|frame| frame.warp_mode) { self.warp_budget.reset(); return false; }\n        self.warp_budget.expired(clock)\n    }".to_owned());
     }
     if uses_yield_at_safe_point {
         if no_warp_timer {
-            helpers
-                .push("    fn yield_at_safe_point(&mut self, _clock: &dyn Clock) -> bool { true }");
+            helpers.push(
+                "    fn yield_at_safe_point(&mut self, _clock: &dyn Clock) -> bool { true }"
+                    .to_owned(),
+            );
         } else {
-            helpers.push("    fn yield_at_safe_point(&mut self, clock: &dyn Clock) -> bool {\n        if !self.frames.last().is_some_and(|frame| frame.warp_mode) { self.warp_budget.reset(); return true; }\n        self.warp_budget.expired(clock)\n    }");
+            helpers.push("    fn yield_at_safe_point(&mut self, clock: &dyn Clock) -> bool {\n        if !self.frames.last().is_some_and(|frame| frame.warp_mode) { self.warp_budget.reset(); return true; }\n        self.warp_budget.expired(clock)\n    }".to_owned());
         }
     }
     if !helpers.is_empty() {

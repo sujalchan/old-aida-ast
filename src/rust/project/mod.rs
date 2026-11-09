@@ -41,6 +41,7 @@ pub(super) struct VariableInfo {
     pub(super) target_variable_order: usize,
     pub(super) numeric: bool,
     pub(super) non_nan: bool,
+    pub(super) writer_count: usize,
     pub(super) monitor_visible: bool,
     pub(super) index_read_override: Option<String>,
 }
@@ -575,15 +576,20 @@ fn generate_internal(
     } else {
         "self.state.observable_snapshot_filtered(tick, include_hidden_items)"
     };
+    let renderer_snapshot_base = if uses_project_timer {
+        "self.state.renderer_snapshot_with_timer(tick, self.scheduler.now_millis())"
+    } else {
+        "self.state.renderer_snapshot(tick)"
+    };
     let snapshot_binding = if monitor_reporters.is_empty() {
         "let snapshot"
     } else {
         "let mut snapshot"
     };
     // reporter monitors with connected inputs temporarily use their declared target context.
-    output.push_str("    pub fn observable_snapshot(&mut self, tick: usize) -> RuntimeSnapshot { self.snapshot(tick, true) }\n");
-    output.push_str("    pub fn renderer_snapshot(&mut self, tick: usize) -> RuntimeSnapshot { self.snapshot(tick, false) }\n");
-    output.push_str(&format!("    fn snapshot(&mut self, tick: usize, include_hidden_items: bool) -> RuntimeSnapshot {{ {snapshot_binding} = {snapshot_base};\n"));
+    output.push_str("    pub fn observable_snapshot(&mut self, tick: usize) -> RuntimeSnapshot { self.snapshot(tick, true, false) }\n");
+    output.push_str("    pub fn renderer_snapshot(&mut self, tick: usize) -> RuntimeSnapshot { self.snapshot(tick, false, true) }\n");
+    output.push_str(&format!("    fn snapshot(&mut self, tick: usize, include_hidden_items: bool, compact_numeric: bool) -> RuntimeSnapshot {{ {snapshot_binding} = if compact_numeric {{ {renderer_snapshot_base} }} else {{ {snapshot_base} }};\n"));
     if !monitor_reporters.is_empty() {
         output.push_str(&format!(
             "        snapshot.reporters = Vec::with_capacity({});\n",
@@ -639,9 +645,18 @@ fn generate_internal(
         }
     };
     let frame_accessors = if uses_frame_accessors {
-        "\nimpl ScriptState {\n    #[inline(always)]\n    fn frame(&self) -> &ProcedureFrame { self.frames.last().unwrap() }\n    #[inline(always)]\n    fn frame_mut(&mut self) -> &mut ProcedureFrame { self.frames.last_mut().unwrap() }\n}\n"
+        let frame = output.contains("script.frame()").then_some(
+            "    #[inline(always)]\n    fn frame(&self) -> &ProcedureFrame { self.frames.last().unwrap() }\n",
+        ).unwrap_or_default();
+        let frame_mut = (output.contains("script.frame_mut()")
+            || uses_pc_setter
+            || uses_pc_transition)
+            .then_some(
+            "    #[inline(always)]\n    fn frame_mut(&mut self) -> &mut ProcedureFrame { self.frames.last_mut().unwrap() }\n",
+        ).unwrap_or_default();
+        format!("\nimpl ScriptState {{\n{frame}{frame_mut}}}\n")
     } else {
-        ""
+        String::new()
     };
     (
         format!("{imports}{print_value_macro}{state_machine_macros}{output}{frame_accessors}"),
@@ -654,6 +669,7 @@ fn generate_internal(
 /// each call site, so they add no runtime dispatch or function-call overhead.
 fn compact_resumable_state_source(source: &str) -> (String, bool, bool, bool) {
     let source = source
+        .replace("script.frames.pop();", "script.pop_frame();")
         .replace("script.frames.last().unwrap()", "script.frame()")
         .replace("script.frames.last_mut().unwrap()", "script.frame_mut()");
     let mut output = String::with_capacity(source.len());

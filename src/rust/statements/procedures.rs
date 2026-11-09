@@ -97,13 +97,29 @@ pub(super) fn generate_resumable_procedure_call(
         .map(|value| format!("({value}).to_owned().into()"))
         .collect::<Vec<_>>();
     let mut frame_values = values.join(", ");
-    if let Some(direct_warp_name) = &entry.direct_warp_name {
-        debug_assert!(no_warp_timer && emit_continue);
+    if let Some(direct_warp_name) = &entry.direct_warp_name
+        && emit_continue
+    {
         line(
             output,
             indent,
             "let inherited_warp = script.frames.last().is_some_and(|frame| frame.warp_mode);",
         );
+        for slot in &cached_slots {
+            if reusable_indexes.is_some_and(|cached| cached.contains(slot)) {
+                continue;
+            }
+            if let Some(variable) = variables.values().find(|variable| variable.slot == *slot) {
+                line(
+                    output,
+                    indent,
+                    &format!(
+                        "let cached_index_{slot} = CachedListIndex::new({});",
+                        variable.read_expression()
+                    ),
+                );
+            }
+        }
         let direct_args = values
             .iter()
             .enumerate()
@@ -121,6 +137,11 @@ pub(super) fn generate_resumable_procedure_call(
         } else {
             format!(", {}", direct_args.join(", "))
         };
+        let direct_frame_args = if direct_args.is_empty() {
+            "[]".to_owned()
+        } else {
+            format!("[{}]", direct_args.trim_start_matches(", "))
+        };
         line(
             output,
             indent,
@@ -134,12 +155,39 @@ pub(super) fn generate_resumable_procedure_call(
                 pc_literal(return_pc)
             ),
         );
+        if !no_warp_timer {
+            line(output, indent + 1, "if script.warp_budget.expired(clock) {");
+            line(
+                output,
+                indent + 2,
+                &format!(
+                    "script.push_frame({}, {}, {}, {}, true);",
+                    entry.function_id,
+                    pc_literal(entry.start_pc),
+                    entry.repeat_count,
+                    direct_frame_args
+                ),
+            );
+            line(output, indent + 2, "return ScriptStatus::Yield;");
+            line(output, indent + 1, "}");
+        }
         line(
             output,
             indent + 1,
-            &format!("{direct_warp_name}(state, clock{direct_args});"),
+            &format!(
+                "if !{direct_warp_name}(state, clock{direct_args}) {{ return ScriptStatus::Complete; }}"
+            ),
         );
-        line(output, indent + 1, "continue;");
+        if !no_warp_timer {
+            line(
+                output,
+                indent + 1,
+                "if script.warp_budget.expired(clock) { return ScriptStatus::Yield; }",
+            );
+        }
+        if emit_continue {
+            line(output, indent + 1, "continue;");
+        }
         line(output, indent, "}");
         frame_values = values
             .iter()
@@ -268,7 +316,7 @@ pub(super) fn generate_resumable_procedure_call(
                     output,
                     indent + 3,
                     &format!(
-                        "script.frames.push(ProcedureFrame::new({}, {}, vec![0; {}], vec![{frame_values}], inherited_warp || {}));",
+                        "script.push_frame({}, {}, {}, [{frame_values}], inherited_warp || {});",
                         entry.function_id,
                         pc_literal(entry.start_pc),
                         entry.repeat_count,
@@ -315,7 +363,7 @@ pub(super) fn generate_resumable_procedure_call(
                 output,
                 call_indent + 1,
                 &format!(
-                    "script.frames.push(ProcedureFrame::new({}, {}, vec![0; {}], vec![{}], inherited_warp || {}));",
+                    "script.push_frame({}, {}, {}, [{}], inherited_warp || {});",
                     entry.function_id,
                     pc_literal(entry.start_pc),
                     entry.repeat_count,
@@ -362,7 +410,7 @@ pub(super) fn generate_resumable_procedure_call(
         output,
         indent,
         &format!(
-            "script.frames.push(ProcedureFrame::new({}, {}, vec![0; {}], vec![{}], inherited_warp || {}));",
+            "script.push_frame({}, {}, {}, [{}], inherited_warp || {});",
             entry.function_id,
             pc_literal(entry.start_pc),
             entry.repeat_count,

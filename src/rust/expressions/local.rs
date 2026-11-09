@@ -288,12 +288,19 @@ pub(super) fn local_block_expression(
                 format!("scratch_to_number({})", expression_argument(&value.code))
             };
             let operator = field_value(block, "OPERATOR")?.as_str()?;
+            let numeric_trig_input = value.kind == LocalValueKind::Number;
             let code = match operator {
+                "sin" if !fast_math && numeric_trig_input => {
+                    format!("scratch_sin_number({numeric})")
+                }
                 "sin" => format!(
                     "{}({})",
                     if fast_math { "fast_sin" } else { "scratch_sin" },
                     expression_argument(&value.code)
                 ),
+                "cos" if !fast_math && numeric_trig_input => {
+                    format!("scratch_cos_number({numeric})")
+                }
                 "cos" => format!(
                     "{}({})",
                     if fast_math { "fast_cos" } else { "scratch_cos" },
@@ -304,6 +311,9 @@ pub(super) fn local_block_expression(
                     if fast_math { "fast_tan" } else { "scratch_tan" },
                     expression_argument(&value.code)
                 ),
+                "asin" if !fast_math && numeric_trig_input => {
+                    format!("scratch_asin_degrees_number({numeric})")
+                }
                 "asin" => format!(
                     "{}({})",
                     if fast_math {

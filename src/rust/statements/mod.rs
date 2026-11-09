@@ -8,9 +8,9 @@ use crate::parser::{InputValue, ScratchBlock, ScratchTarget, parse_input};
 
 use super::{
     expressions::{
-        LocalValueKind, boolean_input, collect_numeric_local_slots, constant_numeric_input,
-        constant_random_bounds, expression, expression_argument, local_expression, local_to_bool,
-        local_to_number,
+        LocalExpression, LocalValueKind, boolean_input, collect_numeric_local_slots,
+        constant_numeric_input, constant_random_bounds, expression, expression_argument,
+        local_expression, local_to_bool, local_to_number,
     },
     literals::{field_value, line, number_literal, quote},
     project::{ListInfo, VariableInfo},

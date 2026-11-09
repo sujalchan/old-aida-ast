@@ -1045,6 +1045,19 @@ pub(super) struct NumericLoopPlan {
     pub(super) body: Vec<String>,
     pub(super) local_slots: Vec<usize>,
     pub(super) written_slots: Vec<usize>,
+    pub(super) stable_updates: Vec<StableNumericUpdate>,
+    pub(super) fast_tail_counters: Option<Vec<(usize, f64)>>,
+}
+
+pub(super) struct StableNumericUpdate {
+    pub(super) slot: usize,
+    pub(super) stability: NumericLoopStability,
+}
+
+pub(super) enum NumericLoopStability {
+    SelfRecurrence,
+    DecreasingPositiveAccumulator { counter_slot: usize },
+    StableInputs(Vec<usize>),
 }
 
 pub(super) fn numeric_loop_plan(
@@ -1123,11 +1136,434 @@ pub(super) fn numeric_loop_plan(
 
     let mut local_slots = local_slots.into_iter().collect::<Vec<_>>();
     local_slots.sort_unstable();
+    let stable_updates = numeric_loop_stable_updates(target, &body, variables);
+    let written_slots = written_slots.into_iter().collect::<Vec<_>>();
+    let fast_tail_counters = numeric_loop_fast_tail_counters(
+        target,
+        block,
+        &body,
+        &written_slots,
+        &stable_updates,
+        variables,
+    );
     Some(NumericLoopPlan {
         body,
         local_slots,
-        written_slots: written_slots.into_iter().collect(),
+        written_slots,
+        stable_updates,
+        fast_tail_counters,
     })
+}
+
+fn numeric_loop_stable_updates(
+    target: &ScratchTarget,
+    body: &[String],
+    variables: &HashMap<String, VariableInfo>,
+) -> Vec<StableNumericUpdate> {
+    let mut write_counts = HashMap::<usize, usize>::new();
+    for id in body {
+        if let Some(block) = target.blocks.get(id)
+            && let Some(variable) = variable_field(block, "VARIABLE", variables)
+        {
+            *write_counts.entry(variable.slot).or_default() += 1;
+        }
+    }
+
+    let mut updates = Vec::new();
+    let mut stable_slots = HashSet::new();
+    for id in body {
+        let Some(block) = target.blocks.get(id) else {
+            continue;
+        };
+        let Some(variable) = variable_field(block, "VARIABLE", variables) else {
+            continue;
+        };
+        if write_counts.get(&variable.slot) != Some(&1) {
+            continue;
+        }
+
+        let stability = if block.opcode == "data_setvariableto"
+            && pure_numeric_dependencies(
+                target,
+                block.inputs.get("VALUE"),
+                variables,
+                &mut HashSet::new(),
+            )
+            .is_some_and(|dependencies| dependencies == HashSet::from([variable.slot]))
+        {
+            Some(NumericLoopStability::SelfRecurrence)
+        } else if matches!(
+            block.opcode.as_str(),
+            "data_changevariableby" | "data_setvariableto"
+        ) {
+            decreasing_positive_accumulator_counter(target, block, body, variables).map(
+                |counter_slot| NumericLoopStability::DecreasingPositiveAccumulator { counter_slot },
+            )
+        } else {
+            None
+        };
+        if let Some(stability) = stability {
+            stable_slots.insert(variable.slot);
+            updates.push(StableNumericUpdate {
+                slot: variable.slot,
+                stability,
+            });
+        }
+    }
+
+    // Once an accumulator is proven fixed, assignments derived only from fixed
+    // values can also stop recomputing after they reach their own fixed value.
+    loop {
+        let mut added = false;
+        for id in body {
+            let Some(block) = target.blocks.get(id) else {
+                continue;
+            };
+            if block.opcode != "data_setvariableto" {
+                continue;
+            }
+            let Some(variable) = variable_field(block, "VARIABLE", variables) else {
+                continue;
+            };
+            if stable_slots.contains(&variable.slot) || write_counts.get(&variable.slot) != Some(&1)
+            {
+                continue;
+            }
+            let Some(dependencies) = pure_numeric_dependencies(
+                target,
+                block.inputs.get("VALUE"),
+                variables,
+                &mut HashSet::new(),
+            ) else {
+                continue;
+            };
+            if dependencies.is_subset(&stable_slots) {
+                let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+                dependencies.sort_unstable();
+                stable_slots.insert(variable.slot);
+                updates.push(StableNumericUpdate {
+                    slot: variable.slot,
+                    stability: NumericLoopStability::StableInputs(dependencies),
+                });
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    updates
+}
+
+fn numeric_loop_fast_tail_counters(
+    target: &ScratchTarget,
+    loop_block: &ScratchBlock,
+    body: &[String],
+    written_slots: &[usize],
+    stable_updates: &[StableNumericUpdate],
+    variables: &HashMap<String, VariableInfo>,
+) -> Option<Vec<(usize, f64)>> {
+    if stable_updates.is_empty() {
+        return None;
+    }
+    let stable_slots = stable_updates
+        .iter()
+        .map(|update| update.slot)
+        .collect::<HashSet<_>>();
+    let stable_written_slots = written_slots
+        .iter()
+        .copied()
+        .filter(|slot| stable_slots.contains(slot))
+        .collect::<HashSet<_>>();
+    let mut counters = Vec::new();
+    let mut counter_slots = HashSet::new();
+    for id in body {
+        let Some(block) = target.blocks.get(id) else {
+            return None;
+        };
+        let Some(variable) = variable_field(block, "VARIABLE", variables) else {
+            return None;
+        };
+        if stable_written_slots.contains(&variable.slot) {
+            continue;
+        }
+        if block.opcode != "data_changevariableby" {
+            return None;
+        }
+        let Some(increment) =
+            constant_numeric_input(target, block.inputs.get("VALUE"), &mut HashSet::new())
+        else {
+            return None;
+        };
+        if !increment.is_finite() || increment.abs() != 1.0 {
+            return None;
+        }
+        if !counter_slots.insert(variable.slot) {
+            return None;
+        }
+        counters.push((variable.slot, increment));
+    }
+
+    if matches!(
+        loop_block.opcode.as_str(),
+        "control_while" | "control_repeat_until"
+    ) {
+        let Some(condition) = pure_boolean_dependencies(
+            target,
+            loop_block.inputs.get("CONDITION"),
+            variables,
+            &mut HashSet::new(),
+        ) else {
+            return None;
+        };
+        if condition.iter().any(|slot| written_slots.contains(slot)) {
+            return None;
+        }
+    }
+    Some(counters)
+}
+
+fn pure_boolean_dependencies(
+    target: &ScratchTarget,
+    input: Option<&Value>,
+    variables: &HashMap<String, VariableInfo>,
+    active: &mut HashSet<String>,
+) -> Option<HashSet<usize>> {
+    match input.and_then(parse_input)? {
+        InputValue::Number(_) | InputValue::String(_) => Some(HashSet::new()),
+        InputValue::VariableReference(reference) => Some(HashSet::from([
+            super::super::project::variable_for_target_index(
+                target.target_index,
+                reference.id,
+                variables,
+            )?
+            .slot,
+        ])),
+        InputValue::BlockReference(id) => {
+            if !active.insert(id.to_owned()) {
+                return None;
+            }
+            let block = target.blocks.get(id)?;
+            let result = match block.opcode.as_str() {
+                "math_number"
+                | "math_integer"
+                | "math_whole_number"
+                | "math_positive_number"
+                | "math_angle" => Some(HashSet::new()),
+                "data_variable" => variable_field(block, "VARIABLE", variables)
+                    .map(|variable| HashSet::from([variable.slot])),
+                "operator_equals" | "operator_gt" | "operator_lt" => merge_numeric_dependencies(
+                    pure_numeric_dependencies(
+                        target,
+                        block.inputs.get("OPERAND1"),
+                        variables,
+                        active,
+                    )?,
+                    pure_numeric_dependencies(
+                        target,
+                        block.inputs.get("OPERAND2"),
+                        variables,
+                        active,
+                    )?,
+                ),
+                "operator_and" | "operator_or" => merge_numeric_dependencies(
+                    pure_boolean_dependencies(
+                        target,
+                        block.inputs.get("OPERAND1"),
+                        variables,
+                        active,
+                    )?,
+                    pure_boolean_dependencies(
+                        target,
+                        block.inputs.get("OPERAND2"),
+                        variables,
+                        active,
+                    )?,
+                ),
+                "operator_not" => pure_boolean_dependencies(
+                    target,
+                    block.inputs.get("OPERAND"),
+                    variables,
+                    active,
+                ),
+                _ => None,
+            };
+            active.remove(id);
+            result
+        }
+        InputValue::Empty | InputValue::ListReference(_) => None,
+    }
+}
+
+fn pure_numeric_dependencies(
+    target: &ScratchTarget,
+    input: Option<&Value>,
+    variables: &HashMap<String, VariableInfo>,
+    active: &mut HashSet<String>,
+) -> Option<HashSet<usize>> {
+    match input.and_then(parse_input)? {
+        InputValue::Number(_) | InputValue::String(_) => Some(HashSet::new()),
+        InputValue::VariableReference(reference) => {
+            let variable = super::super::project::variable_for_target_index(
+                target.target_index,
+                reference.id,
+                variables,
+            )?;
+            Some(HashSet::from([variable.slot]))
+        }
+        InputValue::BlockReference(id) => {
+            if !active.insert(id.to_owned()) {
+                return None;
+            }
+            let block = target.blocks.get(id)?;
+            let result = match block.opcode.as_str() {
+                "math_number"
+                | "math_integer"
+                | "math_whole_number"
+                | "math_positive_number"
+                | "math_angle" => Some(HashSet::new()),
+                "data_variable" => variable_field(block, "VARIABLE", variables)
+                    .map(|variable| HashSet::from([variable.slot])),
+                "operator_add" | "operator_subtract" | "operator_multiply" | "operator_divide"
+                | "operator_mod" => merge_numeric_dependencies(
+                    pure_numeric_dependencies(target, block.inputs.get("NUM1"), variables, active)?,
+                    pure_numeric_dependencies(target, block.inputs.get("NUM2"), variables, active)?,
+                ),
+                "operator_round" => {
+                    pure_numeric_dependencies(target, block.inputs.get("NUM"), variables, active)
+                }
+                "operator_mathop"
+                    if matches!(
+                        field_value(block, "OPERATOR").and_then(Value::as_str),
+                        Some(
+                            "abs"
+                                | "floor"
+                                | "ceiling"
+                                | "sqrt"
+                                | "sin"
+                                | "cos"
+                                | "tan"
+                                | "asin"
+                                | "acos"
+                                | "atan"
+                                | "ln"
+                                | "log"
+                                | "e ^"
+                                | "10 ^"
+                        )
+                    ) =>
+                {
+                    pure_numeric_dependencies(target, block.inputs.get("NUM"), variables, active)
+                }
+                _ => None,
+            };
+            active.remove(id);
+            result
+        }
+        InputValue::Empty | InputValue::ListReference(_) => None,
+    }
+}
+
+fn merge_numeric_dependencies(
+    mut left: HashSet<usize>,
+    right: HashSet<usize>,
+) -> Option<HashSet<usize>> {
+    left.extend(right);
+    Some(left)
+}
+
+fn decreasing_positive_accumulator_counter(
+    target: &ScratchTarget,
+    accumulator: &ScratchBlock,
+    body: &[String],
+    variables: &HashMap<String, VariableInfo>,
+) -> Option<usize> {
+    let accumulator_slot = variable_field(accumulator, "VARIABLE", variables)?.slot;
+    let term = if accumulator.opcode == "data_changevariableby" {
+        accumulator.inputs.get("VALUE")?
+    } else {
+        let InputValue::BlockReference(add_id) = parse_input(accumulator.inputs.get("VALUE")?)?
+        else {
+            return None;
+        };
+        let add = target.blocks.get(add_id)?;
+        if add.opcode != "operator_add" {
+            return None;
+        }
+        let left_is_accumulator =
+            numeric_variable_input_slot(target, add.inputs.get("NUM1"), variables)
+                == Some(accumulator_slot);
+        let right_is_accumulator =
+            numeric_variable_input_slot(target, add.inputs.get("NUM2"), variables)
+                == Some(accumulator_slot);
+        match (left_is_accumulator, right_is_accumulator) {
+            (true, false) => add.inputs.get("NUM2")?,
+            (false, true) => add.inputs.get("NUM1")?,
+            _ => return None,
+        }
+    };
+
+    let InputValue::BlockReference(divide_id) = parse_input(term)? else {
+        return None;
+    };
+    let divide = target.blocks.get(divide_id)?;
+    if divide.opcode != "operator_divide" {
+        return None;
+    }
+    let numerator = constant_numeric_input(target, divide.inputs.get("NUM1"), &mut HashSet::new())?;
+    if !numerator.is_finite() || numerator <= 0.0 {
+        return None;
+    }
+    let InputValue::BlockReference(product_id) = parse_input(divide.inputs.get("NUM2")?)? else {
+        return None;
+    };
+    let product = target.blocks.get(product_id)?;
+    if product.opcode != "operator_multiply" {
+        return None;
+    }
+    let left_slot = numeric_variable_input_slot(target, product.inputs.get("NUM1"), variables)?;
+    let right_slot = numeric_variable_input_slot(target, product.inputs.get("NUM2"), variables)?;
+    if left_slot != right_slot {
+        return None;
+    }
+
+    let mut counter_writes = body.iter().filter_map(|id| {
+        let block = target.blocks.get(id)?;
+        let variable = variable_field(block, "VARIABLE", variables)?;
+        (variable.slot == left_slot).then_some(block)
+    });
+    let counter = counter_writes.next()?;
+    if counter_writes.next().is_some() || counter.opcode != "data_changevariableby" {
+        return None;
+    }
+    let increment =
+        constant_numeric_input(target, counter.inputs.get("VALUE"), &mut HashSet::new())?;
+    (increment.is_finite() && increment > 0.0).then_some(left_slot)
+}
+
+fn numeric_variable_input_slot(
+    target: &ScratchTarget,
+    input: Option<&Value>,
+    variables: &HashMap<String, VariableInfo>,
+) -> Option<usize> {
+    match input.and_then(parse_input)? {
+        InputValue::VariableReference(reference) => Some(
+            super::super::project::variable_for_target_index(
+                target.target_index,
+                reference.id,
+                variables,
+            )?
+            .slot,
+        ),
+        InputValue::BlockReference(id) => {
+            let block = target.blocks.get(id)?;
+            (block.opcode == "data_variable").then(|| {
+                variable_field(block, "VARIABLE", variables).map(|variable| variable.slot)
+            })?
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn generate_native_numeric_loop(
@@ -1145,6 +1581,14 @@ pub(super) fn generate_native_numeric_loop(
         no_warp_timer,
     } = context;
     let pc = graph.block_pcs[id];
+    let stable_value_slot = graph.numeric_loop_slots[id];
+    let stable_state_slot = (plan.stable_updates.len() == 1
+        && matches!(
+            &plan.stable_updates[0].stability,
+            NumericLoopStability::SelfRecurrence
+        )
+        && stable_loop_writer_is_isolated(target, graph, plan.stable_updates[0].slot, variables))
+    .then(|| graph.repeat_slots.len() + graph.numeric_loop_slots[id]);
     let next_pc = block
         .next
         .as_ref()
@@ -1158,13 +1602,24 @@ pub(super) fn generate_native_numeric_loop(
 
     line(output, 4, &format!("{pc} => {{"));
     for slot in &plan.local_slots {
+        let initial_value = if stable_state_slot.is_some()
+            && plan
+                .stable_updates
+                .iter()
+                .any(|update| update.slot == *slot)
+        {
+            format!(
+                "if script.frames.last().unwrap().repeat_counts[{}] & 1 != 0 {{ script.frames.last().unwrap().numeric_loop_values[{stable_value_slot}] }} else {{ {} }}",
+                stable_state_slot.unwrap(),
+                variable_read_for_slot(variables, *slot)
+            )
+        } else {
+            variable_read_for_slot(variables, *slot)
+        };
         line(
             output,
             5,
-            &format!(
-                "let mut scratch_local_{slot} = scratch_to_number({});",
-                variable_read_for_slot(variables, *slot)
-            ),
+            &format!("let mut scratch_local_{slot} = {initial_value};"),
         );
     }
     line(
@@ -1179,9 +1634,19 @@ pub(super) fn generate_native_numeric_loop(
             "if !scratch_warp_mode { script.warp_budget.reset(); }",
         );
     }
+    emit_native_numeric_stability_flags(plan, stable_state_slot, output, 5);
 
     if block.opcode == "control_repeat" {
-        generate_native_repeat_loop(context, id, block, plan, &locals, next_pc, output);
+        generate_native_repeat_loop(
+            context,
+            id,
+            block,
+            plan,
+            &locals,
+            stable_state_slot,
+            next_pc,
+            output,
+        );
     } else {
         line(output, 5, "loop {");
         if block.opcode != "control_forever" {
@@ -1200,9 +1665,41 @@ pub(super) fn generate_native_numeric_loop(
             } else {
                 format!("!({condition})")
             };
-            line(output, 6, &format!("if {exit_condition} {{ break; }}"));
+            if let Some(state_slot) = stable_state_slot {
+                line(output, 6, &format!("if {exit_condition} {{"));
+                line(
+                    output,
+                    7,
+                    &format!("script.frames.last_mut().unwrap().repeat_counts[{state_slot}] = 0;"),
+                );
+                line(output, 7, "break;");
+                line(output, 6, "}");
+            } else {
+                line(output, 6, &format!("if {exit_condition} {{ break; }}"));
+            }
         }
-        generate_native_numeric_body(target, variables, plan, &locals, fast_math, output, 6);
+        if !no_warp_timer {
+            emit_native_stable_tail(
+                plan,
+                &locals,
+                variables,
+                stable_state_slot,
+                stable_value_slot,
+                graph.block_pcs[id],
+                output,
+                6,
+            );
+        }
+        generate_native_numeric_body(
+            target,
+            variables,
+            plan,
+            &locals,
+            fast_math,
+            stable_state_slot,
+            output,
+            6,
+        );
         line(
             output,
             6,
@@ -1217,7 +1714,8 @@ pub(super) fn generate_native_numeric_loop(
             7,
             &format!("script.frames.last_mut().unwrap().pc = {pc};"),
         );
-        generate_local_commits(plan, variables, output, 7);
+        generate_native_local_commits(plan, variables, stable_state_slot, output, 7);
+        emit_native_stable_value_save(plan, stable_state_slot, stable_value_slot, output, 7);
         line(output, 7, "return ScriptStatus::Yield;");
         line(output, 6, "}");
         line(output, 5, "}");
@@ -1241,6 +1739,7 @@ pub(super) fn generate_native_repeat_loop(
     block: &ScratchBlock,
     plan: &NumericLoopPlan,
     locals: &HashMap<usize, String>,
+    stable_state_slot: Option<usize>,
     next_pc: usize,
     output: &mut String,
 ) {
@@ -1252,6 +1751,7 @@ pub(super) fn generate_native_repeat_loop(
         no_warp_timer,
     } = context;
     let pc = graph.block_pcs[id];
+    let stable_value_slot = graph.numeric_loop_slots[id];
     let slot = graph.repeat_slots[id];
     let times = local_expression(
         target,
@@ -1269,6 +1769,13 @@ pub(super) fn generate_native_repeat_loop(
         &format!("let mut repeat_remaining = script.frames.last().unwrap().repeat_counts[{slot}];"),
     );
     line(output, 5, "if repeat_remaining == 0 {");
+    if let Some(state_slot) = stable_state_slot {
+        line(
+            output,
+            6,
+            &format!("script.frames.last_mut().unwrap().repeat_counts[{state_slot}] = 0;"),
+        );
+    }
     line(
         output,
         6,
@@ -1292,7 +1799,42 @@ pub(super) fn generate_native_repeat_loop(
     line(output, 6, "continue;");
     line(output, 5, "}");
     line(output, 5, "loop {");
-    generate_native_numeric_body(target, variables, plan, locals, fast_math, output, 6);
+    if !no_warp_timer {
+        emit_native_repeat_stable_tail(
+            plan,
+            locals,
+            variables,
+            stable_state_slot,
+            graph.numeric_loop_slots[id],
+            slot,
+            pc,
+            next_pc,
+            output,
+            6,
+        );
+    }
+    if let Some(state_slot) = stable_state_slot {
+        line(output, 6, "if repeat_remaining == 0 {");
+        line(
+            output,
+            7,
+            &format!("script.frames.last_mut().unwrap().repeat_counts[{state_slot}] = 0;"),
+        );
+        line(output, 7, "break;");
+        line(output, 6, "}");
+    } else {
+        line(output, 6, "if repeat_remaining == 0 { break; }");
+    }
+    generate_native_numeric_body(
+        target,
+        variables,
+        plan,
+        locals,
+        fast_math,
+        stable_state_slot,
+        output,
+        6,
+    );
     line(output, 6, "repeat_remaining -= 1;");
     line(
         output,
@@ -1316,10 +1858,22 @@ pub(super) fn generate_native_repeat_loop(
             pc_literal(next_pc)
         ),
     );
-    generate_local_commits(plan, variables, output, 7);
+    generate_native_local_commits(plan, variables, stable_state_slot, output, 7);
+    emit_native_stable_value_save(plan, stable_state_slot, stable_value_slot, output, 7);
     line(output, 7, "return ScriptStatus::Yield;");
     line(output, 6, "}");
-    line(output, 6, "if repeat_remaining == 0 { break; }");
+    if let Some(state_slot) = stable_state_slot {
+        line(output, 6, "if repeat_remaining == 0 {");
+        line(
+            output,
+            7,
+            &format!("script.frames.last_mut().unwrap().repeat_counts[{state_slot}] = 0;"),
+        );
+        line(output, 7, "break;");
+        line(output, 6, "}");
+    } else {
+        line(output, 6, "if repeat_remaining == 0 { break; }");
+    }
     line(output, 5, "}");
     generate_local_commits(plan, variables, output, 5);
     line(
@@ -1333,12 +1887,377 @@ pub(super) fn generate_native_repeat_loop(
     line(output, 5, "continue;");
 }
 
+fn stable_update_condition(plan: &NumericLoopPlan) -> String {
+    plan.stable_updates
+        .iter()
+        .map(|update| format!("scratch_loop_stable_{}", update.slot))
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+fn emit_native_stable_tail(
+    plan: &NumericLoopPlan,
+    locals: &HashMap<usize, String>,
+    variables: &HashMap<String, VariableInfo>,
+    stable_state_slot: Option<usize>,
+    stable_value_slot: usize,
+    loop_pc: usize,
+    output: &mut String,
+    indent: usize,
+) {
+    let Some(counters) = &plan.fast_tail_counters else {
+        return;
+    };
+    let stable = stable_update_condition(plan);
+    line(
+        output,
+        indent,
+        &format!("if scratch_warp_mode && ({stable}) {{"),
+    );
+    line(
+        output,
+        indent + 1,
+        "let scratch_batch = script.warp_budget.safe_points_until_check();",
+    );
+    let guards = counters
+        .iter()
+        .map(|(slot, increment)| {
+            let local = &locals[slot];
+            format!(
+                "{local}.is_finite() && {local}.fract() == 0.0 && ({local} + ({increment:?}_f64 * scratch_batch as f64)).abs() <= 4_503_599_627_370_496.0_f64"
+            )
+        })
+        .collect::<Vec<_>>();
+    let guard = if guards.is_empty() {
+        "true".to_owned()
+    } else {
+        guards.join(" && ")
+    };
+    line(output, indent + 1, &format!("if {guard} {{"));
+    for (slot, increment) in counters {
+        let local = &locals[slot];
+        line(
+            output,
+            indent + 2,
+            &format!("{local} += {increment:?}_f64 * scratch_batch as f64;"),
+        );
+    }
+    line(
+        output,
+        indent + 2,
+        "if script.warp_budget.expired_after_safe_points(clock, scratch_batch) {",
+    );
+    line(
+        output,
+        indent + 3,
+        &format!("script.frames.last_mut().unwrap().pc = {loop_pc};"),
+    );
+    generate_native_local_commits(plan, variables, stable_state_slot, output, indent + 3);
+    emit_native_stable_value_save(
+        plan,
+        stable_state_slot,
+        stable_value_slot,
+        output,
+        indent + 3,
+    );
+    line(output, indent + 3, "return ScriptStatus::Yield;");
+    line(output, indent + 2, "}");
+    line(output, indent + 2, "continue;");
+    line(output, indent + 1, "}");
+    line(output, indent, "}");
+
+    emit_native_non_warp_stable_tail(
+        plan,
+        locals,
+        variables,
+        stable_state_slot,
+        stable_value_slot,
+        loop_pc,
+        output,
+        indent,
+    );
+}
+
+fn emit_native_non_warp_stable_tail(
+    plan: &NumericLoopPlan,
+    locals: &HashMap<usize, String>,
+    variables: &HashMap<String, VariableInfo>,
+    stable_state_slot: Option<usize>,
+    stable_value_slot: usize,
+    loop_pc: usize,
+    output: &mut String,
+    indent: usize,
+) {
+    let (Some(state_slot), Some(counters)) = (stable_state_slot, &plan.fast_tail_counters) else {
+        return;
+    };
+    if counters.is_empty() {
+        return;
+    }
+    let stable = stable_update_condition(plan);
+    let writable_slots = plan
+        .written_slots
+        .iter()
+        .map(|slot| format!("{slot}usize"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    line(
+        output,
+        indent,
+        &format!(
+            "if !scratch_warp_mode && ({stable}) && state.can_defer_variable_writes(&[{writable_slots}]) {{"
+        ),
+    );
+    line(output, indent + 1, "let scratch_batch = 1024usize;");
+    let guards = counters
+        .iter()
+        .map(|(slot, increment)| {
+            let local = &locals[slot];
+            format!(
+                "{local}.is_finite() && {local}.fract() == 0.0 && ({local} + ({increment:?}_f64 * scratch_batch as f64)).abs() <= 4_503_599_627_370_496.0_f64"
+            )
+        })
+        .collect::<Vec<_>>();
+    line(
+        output,
+        indent + 1,
+        &format!("if {} {{", guards.join(" && ")),
+    );
+    for (slot, increment) in counters {
+        let local = &locals[slot];
+        line(
+            output,
+            indent + 2,
+            &format!("{local} += {increment:?}_f64 * scratch_batch as f64;"),
+        );
+    }
+    line(
+        output,
+        indent + 2,
+        &format!("script.frames.last_mut().unwrap().repeat_counts[{state_slot}] |= 1usize;"),
+    );
+    line(
+        output,
+        indent + 2,
+        &format!("script.frames.last_mut().unwrap().pc = {loop_pc};"),
+    );
+    generate_native_local_commits(plan, variables, Some(state_slot), output, indent + 2);
+    emit_native_stable_value_save(
+        plan,
+        Some(state_slot),
+        stable_value_slot,
+        output,
+        indent + 2,
+    );
+    line(output, indent + 2, "return ScriptStatus::Yield;");
+    line(output, indent + 1, "}");
+    line(output, indent, "}");
+}
+
+fn emit_native_repeat_stable_tail(
+    plan: &NumericLoopPlan,
+    locals: &HashMap<usize, String>,
+    variables: &HashMap<String, VariableInfo>,
+    stable_state_slot: Option<usize>,
+    stable_value_slot: usize,
+    repeat_slot: usize,
+    loop_pc: usize,
+    next_pc: usize,
+    output: &mut String,
+    indent: usize,
+) {
+    let Some(counters) = &plan.fast_tail_counters else {
+        return;
+    };
+    let stable = stable_update_condition(plan);
+    line(
+        output,
+        indent,
+        &format!("if scratch_warp_mode && ({stable}) {{"),
+    );
+    line(output, indent + 1, "loop {");
+    line(output, indent + 2, "if repeat_remaining == 0 { break; }");
+    line(
+        output,
+        indent + 2,
+        "let scratch_batch = script.warp_budget.safe_points_until_check().min(repeat_remaining.min(u16::MAX as usize) as u16);",
+    );
+    let guards = counters
+        .iter()
+        .map(|(slot, increment)| {
+            let local = &locals[slot];
+            format!(
+                "{local}.is_finite() && {local}.fract() == 0.0 && ({local} + ({increment:?}_f64 * scratch_batch as f64)).abs() <= 4_503_599_627_370_496.0_f64"
+            )
+        })
+        .collect::<Vec<_>>();
+    let guard = if guards.is_empty() {
+        "true".to_owned()
+    } else {
+        guards.join(" && ")
+    };
+    line(output, indent + 2, &format!("if !({guard}) {{ break; }}"));
+    for (slot, increment) in counters {
+        let local = &locals[slot];
+        line(
+            output,
+            indent + 2,
+            &format!("{local} += {increment:?}_f64 * scratch_batch as f64;"),
+        );
+    }
+    line(
+        output,
+        indent + 2,
+        "repeat_remaining -= scratch_batch as usize;",
+    );
+    line(
+        output,
+        indent + 2,
+        &format!(
+            "script.frames.last_mut().unwrap().repeat_counts[{repeat_slot}] = repeat_remaining;"
+        ),
+    );
+    line(
+        output,
+        indent + 2,
+        "if script.warp_budget.expired_after_safe_points(clock, scratch_batch) {",
+    );
+    line(
+        output,
+        indent + 3,
+        &format!(
+            "script.frames.last_mut().unwrap().pc = if repeat_remaining > 0 {{ {} }} else {{ {} }};",
+            loop_pc,
+            pc_literal(next_pc)
+        ),
+    );
+    generate_native_local_commits(plan, variables, stable_state_slot, output, indent + 3);
+    emit_native_stable_value_save(
+        plan,
+        stable_state_slot,
+        stable_value_slot,
+        output,
+        indent + 3,
+    );
+    line(output, indent + 3, "return ScriptStatus::Yield;");
+    line(output, indent + 2, "}");
+    line(output, indent + 1, "}");
+    line(output, indent, "}");
+
+    emit_native_non_warp_repeat_stable_tail(
+        plan,
+        locals,
+        variables,
+        stable_state_slot,
+        stable_value_slot,
+        repeat_slot,
+        loop_pc,
+        next_pc,
+        output,
+        indent,
+    );
+}
+
+fn emit_native_non_warp_repeat_stable_tail(
+    plan: &NumericLoopPlan,
+    locals: &HashMap<usize, String>,
+    variables: &HashMap<String, VariableInfo>,
+    stable_state_slot: Option<usize>,
+    stable_value_slot: usize,
+    repeat_slot: usize,
+    loop_pc: usize,
+    next_pc: usize,
+    output: &mut String,
+    indent: usize,
+) {
+    let (Some(state_slot), Some(counters)) = (stable_state_slot, &plan.fast_tail_counters) else {
+        return;
+    };
+    if counters.is_empty() {
+        return;
+    }
+    let stable = stable_update_condition(plan);
+    let writable_slots = plan
+        .written_slots
+        .iter()
+        .map(|slot| format!("{slot}usize"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    line(
+        output,
+        indent,
+        &format!(
+            "if !scratch_warp_mode && ({stable}) && state.can_defer_variable_writes(&[{writable_slots}]) && repeat_remaining > 0 {{"
+        ),
+    );
+    line(
+        output,
+        indent + 1,
+        "let scratch_batch = repeat_remaining.min(64);",
+    );
+    let guards = counters
+        .iter()
+        .map(|(slot, increment)| {
+            let local = &locals[slot];
+            format!(
+                "{local}.is_finite() && {local}.fract() == 0.0 && ({local} + ({increment:?}_f64 * scratch_batch as f64)).abs() <= 4_503_599_627_370_496.0_f64"
+            )
+        })
+        .collect::<Vec<_>>();
+    line(
+        output,
+        indent + 1,
+        &format!("if {} {{", guards.join(" && ")),
+    );
+    for (slot, increment) in counters {
+        let local = &locals[slot];
+        line(
+            output,
+            indent + 2,
+            &format!("{local} += {increment:?}_f64 * scratch_batch as f64;"),
+        );
+    }
+    line(output, indent + 2, "repeat_remaining -= scratch_batch;");
+    line(
+        output,
+        indent + 2,
+        &format!(
+            "script.frames.last_mut().unwrap().repeat_counts[{repeat_slot}] = repeat_remaining;"
+        ),
+    );
+    line(
+        output,
+        indent + 2,
+        &format!("script.frames.last_mut().unwrap().repeat_counts[{state_slot}] |= 1usize;"),
+    );
+    line(
+        output,
+        indent + 2,
+        &format!(
+            "script.frames.last_mut().unwrap().pc = if repeat_remaining > 0 {{ {loop_pc} }} else {{ {} }};",
+            pc_literal(next_pc)
+        ),
+    );
+    generate_native_local_commits(plan, variables, Some(state_slot), output, indent + 2);
+    emit_native_stable_value_save(
+        plan,
+        Some(state_slot),
+        stable_value_slot,
+        output,
+        indent + 2,
+    );
+    line(output, indent + 2, "return ScriptStatus::Yield;");
+    line(output, indent + 1, "}");
+    line(output, indent, "}");
+}
+
 pub(super) fn generate_native_numeric_body(
     target: &ScratchTarget,
     variables: &HashMap<String, VariableInfo>,
     plan: &NumericLoopPlan,
     locals: &HashMap<usize, String>,
     fast_math: bool,
+    stable_state_slot: Option<usize>,
     output: &mut String,
     indent: usize,
 ) {
@@ -1356,38 +2275,204 @@ pub(super) fn generate_native_numeric_body(
         )
         .expect("numeric loop expression was validated");
         let local = &locals[&variable.slot];
-        if block.opcode == "data_setvariableto" {
-            assert_eq!(value.kind, LocalValueKind::Number);
-            line(
-                output,
-                indent,
-                &format!("{local} = {};", expression_argument(&value.code)),
-            );
-        } else if let Some(constant) = variable
-            .non_nan
-            .then(|| {
-                constant_numeric_input(target, block.inputs.get("VALUE"), &mut HashSet::new())
-                    .filter(|value| value.is_finite())
-            })
-            .flatten()
+        if let Some(update) = plan
+            .stable_updates
+            .iter()
+            .find(|update| update.slot == variable.slot)
         {
-            line(output, indent, &format!("{local} += {constant:?}_f64;"));
-        } else if fast_math && value.kind == LocalValueKind::Number {
-            line(
+            let stable = format!("scratch_loop_stable_{}", variable.slot);
+            let previous = format!("scratch_loop_previous_{}", variable.slot);
+            line(output, indent, &format!("if !{stable} {{"));
+            line(output, indent + 1, &format!("let {previous} = {local};"));
+            emit_native_numeric_assignment(
+                target,
+                block,
+                &variable,
+                &value,
+                local,
+                fast_math,
                 output,
-                indent,
-                &format!("{local} += {};", expression_argument(&value.code)),
+                indent + 1,
             );
+            let fixed = format!("{local}.to_bits() == {previous}.to_bits()");
+            let fixed = match &update.stability {
+                NumericLoopStability::SelfRecurrence => fixed,
+                NumericLoopStability::DecreasingPositiveAccumulator { counter_slot } => {
+                    format!(
+                        "{fixed} && scratch_local_{counter_slot}.is_finite() && scratch_local_{counter_slot} > 0.0"
+                    )
+                }
+                NumericLoopStability::StableInputs(dependencies) => {
+                    dependencies.iter().fold(fixed, |condition, dependency| {
+                        format!("{condition} && scratch_loop_stable_{dependency}")
+                    })
+                }
+            };
+            line(output, indent + 1, &format!("{stable} = {fixed};"));
+            if let Some(state_slot) = stable_state_slot {
+                let update_index = plan
+                    .stable_updates
+                    .iter()
+                    .position(|candidate| candidate.slot == variable.slot)
+                    .expect("stable numeric update index was validated");
+                line(output, indent + 1, &format!("if {stable} {{"));
+                line(
+                    output,
+                    indent + 2,
+                    &format!(
+                        "script.frames.last_mut().unwrap().repeat_counts[{state_slot}] |= 1usize << {update_index};"
+                    ),
+                );
+                line(output, indent + 1, "}");
+            }
+            line(output, indent, "}");
         } else {
+            emit_native_numeric_assignment(
+                target, block, &variable, &value, local, fast_math, output, indent,
+            );
+        }
+    }
+}
+
+pub(super) fn emit_numeric_stability_flags(
+    plan: &NumericLoopPlan,
+    output: &mut String,
+    indent: usize,
+) {
+    for update in &plan.stable_updates {
+        line(
+            output,
+            indent,
+            &format!("let mut scratch_loop_stable_{} = false;", update.slot),
+        );
+    }
+}
+
+fn emit_native_numeric_stability_flags(
+    plan: &NumericLoopPlan,
+    state_slot: Option<usize>,
+    output: &mut String,
+    indent: usize,
+) {
+    for (index, update) in plan.stable_updates.iter().enumerate() {
+        let stable = if let Some(slot) = state_slot {
+            format!(
+                "script.frames.last().unwrap().repeat_counts[{slot}] & (1usize << {index}) != 0"
+            )
+        } else {
+            "false".to_owned()
+        };
+        line(
+            output,
+            indent,
+            &format!("let mut scratch_loop_stable_{} = {stable};", update.slot),
+        );
+        if let Some(slot) = state_slot {
             line(
                 output,
                 indent,
                 &format!(
-                    "{local} = scratch_add({local}, {});",
-                    expression_argument(&value.code)
+                    "let scratch_loop_was_stable_{} = scratch_loop_stable_{};",
+                    update.slot, update.slot
                 ),
             );
+            line(
+                output,
+                indent,
+                &format!(
+                    "if script.frames.last().unwrap().repeat_counts[{slot}] & (1usize << {index}) != 0 && !scratch_loop_stable_{} {{",
+                    update.slot
+                ),
+            );
+            line(
+                output,
+                indent + 1,
+                &format!(
+                    "script.frames.last_mut().unwrap().repeat_counts[{slot}] &= !(1usize << {index});"
+                ),
+            );
+            line(output, indent, "}");
         }
+    }
+}
+
+fn stable_loop_writer_is_isolated(
+    target: &ScratchTarget,
+    graph: &ScriptGraph,
+    slot: usize,
+    variables: &HashMap<String, VariableInfo>,
+) -> bool {
+    let Some(variable) = variables.values().find(|variable| variable.slot == slot) else {
+        return false;
+    };
+    if variable.monitor_visible
+        || target
+            .blocks
+            .values()
+            .any(|block| block.opcode == "procedures_call")
+    {
+        return false;
+    }
+    let graph_writes = graph
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            ScriptNode::Block(id) => target.blocks.get(id),
+            ScriptNode::LoopBoundary(_) => None,
+        })
+        .filter(|block| {
+            matches!(
+                block.opcode.as_str(),
+                "data_setvariableto" | "data_changevariableby"
+            )
+        })
+        .filter_map(|block| variable_field(block, "VARIABLE", variables))
+        .filter(|written| written.slot == slot)
+        .count();
+    graph_writes == variable.writer_count
+}
+
+fn emit_native_numeric_assignment(
+    target: &ScratchTarget,
+    block: &ScratchBlock,
+    variable: &VariableInfo,
+    value: &LocalExpression,
+    local: &str,
+    fast_math: bool,
+    output: &mut String,
+    indent: usize,
+) {
+    if block.opcode == "data_setvariableto" {
+        assert_eq!(value.kind, LocalValueKind::Number);
+        line(
+            output,
+            indent,
+            &format!("{local} = {};", expression_argument(&value.code)),
+        );
+    } else if let Some(constant) = variable
+        .non_nan
+        .then(|| {
+            constant_numeric_input(target, block.inputs.get("VALUE"), &mut HashSet::new())
+                .filter(|value| value.is_finite())
+        })
+        .flatten()
+    {
+        line(output, indent, &format!("{local} += {constant:?}_f64;"));
+    } else if fast_math && value.kind == LocalValueKind::Number {
+        line(
+            output,
+            indent,
+            &format!("{local} += {};", expression_argument(&value.code)),
+        );
+    } else {
+        line(
+            output,
+            indent,
+            &format!(
+                "{local} = scratch_add({local}, {});",
+                expression_argument(&value.code)
+            ),
+        );
     }
 }
 
@@ -1406,6 +2491,68 @@ pub(super) fn generate_local_commits(
     }
 }
 
+fn generate_native_local_commits(
+    plan: &NumericLoopPlan,
+    variables: &HashMap<String, VariableInfo>,
+    stable_state_slot: Option<usize>,
+    output: &mut String,
+    indent: usize,
+) {
+    for slot in &plan.written_slots {
+        if stable_state_slot.is_some()
+            && plan
+                .stable_updates
+                .iter()
+                .any(|update| update.slot == *slot)
+        {
+            line(
+                output,
+                indent,
+                &format!("if !scratch_loop_was_stable_{slot} {{"),
+            );
+            line(
+                output,
+                indent + 1,
+                &variable_write_for_slot(variables, *slot, &format!("scratch_local_{slot}.into()")),
+            );
+            line(output, indent, "}");
+        } else {
+            line(
+                output,
+                indent,
+                &variable_write_for_slot(variables, *slot, &format!("scratch_local_{slot}.into()")),
+            );
+        }
+    }
+}
+
+fn emit_native_stable_value_save(
+    plan: &NumericLoopPlan,
+    stable_state_slot: Option<usize>,
+    value_slot: usize,
+    output: &mut String,
+    indent: usize,
+) {
+    if stable_state_slot.is_none() {
+        return;
+    }
+    let update = &plan.stable_updates[0];
+    line(
+        output,
+        indent,
+        &format!("if scratch_loop_stable_{} {{", update.slot),
+    );
+    line(
+        output,
+        indent + 1,
+        &format!(
+            "script.frames.last_mut().unwrap().numeric_loop_values[{value_slot}] = scratch_local_{};",
+            update.slot
+        ),
+    );
+    line(output, indent, "}");
+}
+
 pub(super) fn variable_read_for_slot(
     variables: &HashMap<String, VariableInfo>,
     slot: usize,
@@ -1413,8 +2560,19 @@ pub(super) fn variable_read_for_slot(
     variables
         .values()
         .find(|variable| variable.slot == slot)
-        .map(VariableInfo::read_expression)
-        .unwrap_or_else(|| format!("state.get({slot})"))
+        .map(|variable| {
+            if variable.numeric {
+                let method = if variable.is_stage {
+                    "get_shared_number"
+                } else {
+                    "get_number"
+                };
+                format!("state.{method}({})", variable.slot)
+            } else {
+                format!("scratch_to_number({})", variable.read_expression())
+            }
+        })
+        .unwrap_or_else(|| format!("scratch_to_number(state.get({slot}))"))
 }
 
 pub(super) fn variable_write_for_slot(
@@ -1425,7 +2583,19 @@ pub(super) fn variable_write_for_slot(
     variables
         .values()
         .find(|variable| variable.slot == slot)
-        .map(|variable| variable.write_statement(value))
+        .map(|variable| {
+            if variable.numeric {
+                let method = if variable.is_stage {
+                    "set_shared_number_unobserved"
+                } else {
+                    "set_local_number"
+                };
+                let numeric_value = value.strip_suffix(".into()").unwrap_or(value);
+                format!("state.{method}({}, {numeric_value});", variable.slot)
+            } else {
+                variable.write_statement(value)
+            }
+        })
         .unwrap_or_else(|| format!("state.set({slot}, {value});"))
 }
 
