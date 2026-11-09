@@ -1585,15 +1585,9 @@ fn generate_resumable_block_chain(
             Vec::new()
         };
         let has_locals = !numeric.is_empty() || !dynamic.is_empty();
-        let has_visible_mutation = deferred.iter().any(|slot| {
-            variables
-                .values()
-                .any(|variable| variable.slot == *slot && variable.monitor_visible)
-        }) || dynamic.iter().any(|variable| variable.monitor_visible);
-        // The fast branch can never pass can_defer_variable_writes when a
-        // written variable has a visible monitor. Omit that unreachable copy;
-        // the generic path already preserves every monitor update.
-        let has_optimized_locals = has_locals && !has_visible_mutation;
+        let has_optimized_locals = has_locals;
+        let entry_guards = numeric_entry_guards(&numeric, &needed);
+        let has_dynamic_fallback = has_optimized_locals && !entry_guards.is_empty();
         let mut typed_variables = variables.clone();
         for variable in typed_variables.values_mut() {
             if numeric_slots.contains(&variable.slot) {
@@ -1603,49 +1597,42 @@ fn generate_resumable_block_chain(
             }
         }
         if has_optimized_locals {
-            let pattern = numeric
+            let defer_slots = deferred
                 .iter()
-                .filter(|v| needed.contains(&v.slot))
-                .map(|v| format!("Some(mut scratch_typed_{})", v.slot))
-                .collect::<Vec<_>>();
-            let values = numeric
-                .iter()
-                .filter(|v| needed.contains(&v.slot))
-                .map(|v| format!("{}.canonical_number()", v.read_expression()))
-                .collect::<Vec<_>>();
-            let slots = numeric
-                .iter()
-                .filter(|v| deferred.contains(&v.slot))
-                .chain(dynamic.iter())
-                .map(|v| v.slot.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let pattern = std::iter::once("true".to_owned())
-                .chain(pattern)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let values = std::iter::once(format!("state.can_defer_variable_writes(&[{slots}])"))
-                .chain(values)
-                .collect::<Vec<_>>()
-                .join(", ");
-            line(output, 5, &format!("if let ({pattern},) = ({values},) {{"));
-            for variable in numeric.iter().filter(|v| !needed.contains(&v.slot)) {
+                .copied()
+                .chain(dynamic.iter().map(|variable| variable.slot))
+                .collect::<HashSet<_>>();
+            if !defer_slots.is_empty() {
+                let mut slots = defer_slots.into_iter().collect::<Vec<_>>();
+                slots.sort_unstable();
                 line(
                     output,
-                    6,
-                    &format!("let mut scratch_typed_{} = 0.0_f64;", variable.slot),
+                    5,
+                    &format!(
+                        "let scratch_defer_writes = state.can_defer_variable_writes(&[{}]);",
+                        slots
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 );
             }
+            if has_dynamic_fallback {
+                emit_numeric_entry_guard(output, 5, &entry_guards);
+            }
+            let local_indent = 5 + usize::from(has_dynamic_fallback);
+            emit_numeric_local_initializers(output, local_indent, &numeric, &needed);
             for variable in numeric.iter().filter(|v| deferred.contains(&v.slot)) {
                 line(
                     output,
-                    6,
+                    local_indent,
                     &format!("let mut scratch_dirty_{} = false;", variable.slot),
                 );
                 if textual.contains(&variable.slot) {
                     line(
                         output,
-                        6,
+                        local_indent,
                         &format!("let mut scratch_text_{} = false;", variable.slot),
                     );
                 }
@@ -1658,12 +1645,12 @@ fn generate_resumable_block_chain(
                 };
                 line(
                     output,
-                    6,
+                    local_indent,
                     &format!("let mut scratch_dynamic_{} = {initial};", variable.slot),
                 );
                 line(
                     output,
-                    6,
+                    local_indent,
                     &format!("let mut scratch_dynamic_dirty_{} = false;", variable.slot),
                 );
             }
@@ -1673,9 +1660,9 @@ fn generate_resumable_block_chain(
             last = next;
         }
         let no_numeric_slots = HashSet::new();
-        for optimized in 0..if has_optimized_locals { 2 } else { 1 } {
+        for optimized in 0..if has_dynamic_fallback { 2 } else { 1 } {
             let typed = has_optimized_locals && optimized == 0;
-            let block_indent = if has_optimized_locals { 6 } else { 5 };
+            let block_indent = if has_dynamic_fallback { 6 } else { 5 };
             if repeat && has_locals {
                 let slot = graph.repeat_slots[loop_id];
                 line(
@@ -1848,11 +1835,11 @@ fn generate_resumable_block_chain(
                     ),
                 );
             }
-            if has_optimized_locals && optimized == 0 {
+            if has_dynamic_fallback && optimized == 0 {
                 line(output, 5, "} else {");
             }
         }
-        if has_optimized_locals {
+        if has_dynamic_fallback {
             line(output, 5, "}");
         }
         line(output, 5, "continue;");
@@ -1875,6 +1862,8 @@ fn generate_resumable_block_chain(
             true,
         );
         let numeric_slots = numeric.iter().map(|v| v.slot).collect::<HashSet<_>>();
+        let entry_guards = numeric_entry_guards(&numeric, &needed);
+        let has_dynamic_fallback = !entry_guards.is_empty();
         let mut typed_variables = variables.clone();
         for variable in typed_variables.values_mut() {
             if numeric_slots.contains(&variable.slot) {
@@ -1882,58 +1871,47 @@ fn generate_resumable_block_chain(
             }
         }
         line(output, 4, &format!("{} => {{", graph.block_pcs[id]));
+        if !deferred.is_empty() {
+            let mut slots = deferred.iter().copied().collect::<Vec<_>>();
+            slots.sort_unstable();
+            line(
+                output,
+                5,
+                &format!(
+                    "let scratch_defer_writes = state.can_defer_variable_writes(&[{}]);",
+                    slots
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+        if has_dynamic_fallback {
+            emit_numeric_entry_guard(output, 5, &entry_guards);
+        }
         if !numeric.is_empty() {
-            let pattern = numeric
-                .iter()
-                .filter(|v| needed.contains(&v.slot))
-                .map(|v| format!("Some(mut scratch_typed_{})", v.slot))
-                .collect::<Vec<_>>();
-            let values = numeric
-                .iter()
-                .filter(|v| needed.contains(&v.slot))
-                .map(|v| format!("{}.canonical_number()", v.read_expression()))
-                .collect::<Vec<_>>();
-            let slots = numeric
-                .iter()
-                .filter(|v| deferred.contains(&v.slot))
-                .map(|v| v.slot.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let pattern = std::iter::once("true".to_owned())
-                .chain(pattern)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let values = std::iter::once(format!("state.can_defer_variable_writes(&[{slots}])"))
-                .chain(values)
-                .collect::<Vec<_>>()
-                .join(", ");
-            line(output, 5, &format!("if let ({pattern},) = ({values},) {{"));
-            for variable in numeric.iter().filter(|v| !needed.contains(&v.slot)) {
-                line(
-                    output,
-                    6,
-                    &format!("let mut scratch_typed_{} = 0.0_f64;", variable.slot),
-                );
-            }
+            let local_indent = 5 + usize::from(has_dynamic_fallback);
+            emit_numeric_local_initializers(output, local_indent, &numeric, &needed);
             for variable in numeric.iter().filter(|v| deferred.contains(&v.slot)) {
                 line(
                     output,
-                    6,
+                    local_indent,
                     &format!("let mut scratch_dirty_{} = false;", variable.slot),
                 );
                 if textual.contains(&variable.slot) {
                     line(
                         output,
-                        6,
+                        local_indent,
                         &format!("let mut scratch_text_{} = false;", variable.slot),
                     );
                 }
             }
         }
         let empty = HashSet::new();
-        for version in 0..if numeric.is_empty() { 1 } else { 2 } {
+        for version in 0..if has_dynamic_fallback { 2 } else { 1 } {
             let typed = !numeric.is_empty() && version == 0;
-            let level = if numeric.is_empty() { 5 } else { 6 };
+            let level = 5 + usize::from(has_dynamic_fallback);
             let repeat_slot = graph.repeat_slots[loop_id];
             let next_pc = enclosing
                 .next
@@ -2030,10 +2008,12 @@ fn generate_resumable_block_chain(
             );
             if typed {
                 emit_deferred_numeric_commits(output, level, &numeric, &deferred, &textual);
-                line(output, 5, "} else {");
+                if has_dynamic_fallback {
+                    line(output, 5, "} else {");
+                }
             }
         }
-        if !numeric.is_empty() {
+        if has_dynamic_fallback {
             line(output, 5, "}");
         }
         line(output, 5, "continue;");
@@ -2095,6 +2075,8 @@ fn generate_resumable_block_chain(
             true,
         );
         let numeric_slots = numeric.iter().map(|v| v.slot).collect::<HashSet<_>>();
+        let entry_guards = numeric_entry_guards(&numeric, &needed);
+        let has_dynamic_fallback = !entry_guards.is_empty();
         let mut typed_variables = variables.clone();
         for variable in typed_variables.values_mut() {
             if numeric_slots.contains(&variable.slot) {
@@ -2107,58 +2089,47 @@ fn generate_resumable_block_chain(
         }
         let continuation = graph.fallthrough_pcs[last];
         line(output, 4, &format!("{} => {{", graph.block_pcs[id]));
+        if !deferred.is_empty() {
+            let mut slots = deferred.iter().copied().collect::<Vec<_>>();
+            slots.sort_unstable();
+            line(
+                output,
+                5,
+                &format!(
+                    "let scratch_defer_writes = state.can_defer_variable_writes(&[{}]);",
+                    slots
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
         if !numeric.is_empty() {
-            let pattern = std::iter::once("true".to_owned())
-                .chain(
-                    numeric
-                        .iter()
-                        .filter(|v| needed.contains(&v.slot))
-                        .map(|v| format!("Some(mut scratch_typed_{})", v.slot)),
-                )
-                .collect::<Vec<_>>()
-                .join(", ");
-            let slots = numeric
-                .iter()
-                .filter(|v| deferred.contains(&v.slot))
-                .map(|v| v.slot.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let values = std::iter::once(format!("state.can_defer_variable_writes(&[{slots}])"))
-                .chain(
-                    numeric
-                        .iter()
-                        .filter(|v| needed.contains(&v.slot))
-                        .map(|v| format!("{}.canonical_number()", v.read_expression())),
-                )
-                .collect::<Vec<_>>()
-                .join(", ");
-            line(output, 5, &format!("if let ({pattern},) = ({values},) {{"));
-            for variable in numeric.iter().filter(|v| !needed.contains(&v.slot)) {
-                line(
-                    output,
-                    6,
-                    &format!("let mut scratch_typed_{} = 0.0_f64;", variable.slot),
-                );
+            if has_dynamic_fallback {
+                emit_numeric_entry_guard(output, 5, &entry_guards);
             }
+            let local_indent = 5 + usize::from(has_dynamic_fallback);
+            emit_numeric_local_initializers(output, local_indent, &numeric, &needed);
             for variable in numeric.iter().filter(|v| deferred.contains(&v.slot)) {
                 line(
                     output,
-                    6,
+                    local_indent,
                     &format!("let mut scratch_dirty_{} = false;", variable.slot),
                 );
                 if textual.contains(&variable.slot) {
                     line(
                         output,
-                        6,
+                        local_indent,
                         &format!("let mut scratch_text_{} = false;", variable.slot),
                     );
                 }
             }
         }
         let empty = HashSet::new();
-        for version in 0..if numeric.is_empty() { 1 } else { 2 } {
+        for version in 0..if has_dynamic_fallback { 2 } else { 1 } {
             let typed = !numeric.is_empty() && version == 0;
-            let level = if numeric.is_empty() { 5 } else { 6 };
+            let level = 5 + usize::from(has_dynamic_fallback);
             line(output, level, "let mut scratch_region_escaped = false;");
             let mut region_output = String::new();
             let requires_escape_label = emit_partial_structured_chain(
@@ -2201,11 +2172,11 @@ fn generate_resumable_block_chain(
                     pc_literal(continuation)
                 ),
             );
-            if typed {
+            if has_dynamic_fallback && typed {
                 line(output, 5, "} else {");
             }
         }
-        if !numeric.is_empty() {
+        if has_dynamic_fallback {
             line(output, 5, "}");
         }
         line(output, 5, "continue;");
@@ -2228,54 +2199,46 @@ fn generate_resumable_block_chain(
             emitted_blocks.insert((*id).to_owned());
         }
         let slots = numeric.iter().map(|v| v.slot).collect::<HashSet<_>>();
+        let entry_guards = numeric_entry_guards(&numeric, &needed);
+        let has_dynamic_fallback = !entry_guards.is_empty();
         let mut typed_variables = variables.clone();
         for variable in typed_variables.values_mut() {
             if slots.contains(&variable.slot) {
                 variable.index_read_override = Some(format!("scratch_typed_{}", variable.slot));
             }
         }
-        let pattern = std::iter::once("true".to_owned())
-            .chain(
-                numeric
-                    .iter()
-                    .filter(|v| needed.contains(&v.slot))
-                    .map(|v| format!("Some(mut scratch_typed_{})", v.slot)),
-            )
-            .collect::<Vec<_>>()
-            .join(", ");
-        let guarded = numeric
-            .iter()
-            .filter(|v| needed.contains(&v.slot))
-            .map(|v| format!("{}.canonical_number()", v.read_expression()));
-        let deferred_slots = numeric
-            .iter()
-            .filter(|v| deferred.contains(&v.slot))
-            .map(|v| v.slot.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let values = std::iter::once(format!(
-            "state.can_defer_variable_writes(&[{deferred_slots}])"
-        ))
-        .chain(guarded)
-        .collect::<Vec<_>>()
-        .join(", ");
         line(output, 4, &format!("{} => {{", graph.block_pcs[id]));
-        line(output, 5, &format!("if let ({pattern},) = ({values},) {{"));
-        for variable in numeric.iter().filter(|v| !needed.contains(&v.slot)) {
+        if !deferred.is_empty() {
+            let mut deferred_slots = deferred.iter().copied().collect::<Vec<_>>();
+            deferred_slots.sort_unstable();
             line(
                 output,
-                6,
-                &format!("let mut scratch_typed_{} = 0.0_f64;", variable.slot),
+                5,
+                &format!(
+                    "let scratch_defer_writes = state.can_defer_variable_writes(&[{}]);",
+                    deferred_slots
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             );
         }
+        if has_dynamic_fallback {
+            emit_numeric_entry_guard(output, 5, &entry_guards);
+        }
+        let body_indent = 5 + usize::from(has_dynamic_fallback);
+        emit_numeric_local_initializers(output, body_indent, &numeric, &needed);
         for variable in numeric.iter().filter(|v| deferred.contains(&v.slot)) {
             line(
                 output,
-                6,
+                body_indent,
                 &format!("let mut scratch_dirty_{} = false;", variable.slot),
             );
         }
-        for typed in [true, false] {
+        for version in 0..if has_dynamic_fallback { 2 } else { 1 } {
+            let typed = version == 0;
+            let statement_indent = body_indent;
             let active = if typed { &typed_variables } else { variables };
             for current in &ids {
                 let statement = &target.blocks[*current];
@@ -2295,7 +2258,7 @@ fn generate_resumable_block_chain(
                             statement,
                             &variable,
                             output,
-                            6,
+                            statement_indent,
                         );
                     } else {
                         let value = expression(
@@ -2308,17 +2271,18 @@ fn generate_resumable_block_chain(
                         );
                         line(
                             output,
-                            6,
+                            statement_indent,
                             &format!("let scratch_change = scratch_to_number({value});"),
                         );
                         line(
                             output,
-                            6,
+                            statement_indent,
                             &format!(
-                                "scratch_typed_{0} = scratch_number_operand(scratch_typed_{0}) + scratch_change; scratch_dirty_{0} = true;",
+                                "scratch_typed_{0} = scratch_number_operand(scratch_typed_{0}) + scratch_change;",
                                 variable.slot
                             ),
                         );
+                        emit_numeric_write_commit(output, statement_indent, &variable, &deferred);
                     }
                 } else {
                     generate_resumable_statement(
@@ -2331,16 +2295,26 @@ fn generate_resumable_block_chain(
                         statement,
                         usize::MAX,
                         output,
-                        6,
+                        statement_indent,
                     );
                 }
             }
             if typed {
-                emit_deferred_numeric_commits(output, 6, &numeric, &deferred, &HashSet::new());
-                line(output, 5, "} else {");
+                emit_deferred_numeric_commits(
+                    output,
+                    body_indent,
+                    &numeric,
+                    &deferred,
+                    &HashSet::new(),
+                );
+                if has_dynamic_fallback {
+                    line(output, 5, "} else {");
+                }
             }
         }
-        line(output, 5, "}");
+        if has_dynamic_fallback {
+            line(output, 5, "}");
+        }
         let last = ids.last().unwrap();
         let next = target.blocks[*last]
             .next

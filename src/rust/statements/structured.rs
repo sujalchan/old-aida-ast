@@ -16,15 +16,18 @@ fn is_borrowed_scratch_value_input(
             super::super::project::variable_for_target(target, reference.id, variables)
                 .is_some_and(borrowed_variable)
         }
-        Some(InputValue::BlockReference(id)) => target.blocks.get(id).is_some_and(|block| {
-            match block.opcode.as_str() {
-                "data_itemoflist" => true,
-                "data_variable" => variable_field(block, "VARIABLE", variables)
-                    .is_some_and(|variable| borrowed_variable(&variable)),
-                "argument_reporter_string_number" | "argument_reporter_boolean" => true,
-                _ => false,
-            }
-        }),
+        Some(InputValue::BlockReference(id)) => {
+            target
+                .blocks
+                .get(id)
+                .is_some_and(|block| match block.opcode.as_str() {
+                    "data_itemoflist" => true,
+                    "data_variable" => variable_field(block, "VARIABLE", variables)
+                        .is_some_and(|variable| borrowed_variable(&variable)),
+                    "argument_reporter_string_number" | "argument_reporter_boolean" => true,
+                    _ => false,
+                })
+        }
         _ => false,
     }
 }
@@ -229,6 +232,162 @@ pub(super) struct TypedNumericSetContext<'a> {
     pub(super) textual: &'a HashSet<usize>,
 }
 
+pub(super) fn numeric_entry_guards<'a>(
+    numeric: &'a [VariableInfo],
+    needed: &HashSet<usize>,
+) -> Vec<&'a VariableInfo> {
+    // Numeric type analysis proves the ScratchValue variant, including when
+    // the stored Number may be NaN. number_or_nan preserves that NaN value;
+    // canonical_number is needed only when the runtime type can vary.
+    numeric
+        .iter()
+        .filter(|variable| needed.contains(&variable.slot) && !variable.numeric)
+        .collect()
+}
+
+pub(super) fn emit_numeric_local_initializers(
+    output: &mut String,
+    indent: usize,
+    numeric: &[VariableInfo],
+    needed: &HashSet<usize>,
+) {
+    for variable in numeric
+        .iter()
+        .filter(|variable| needed.contains(&variable.slot) && variable.numeric)
+    {
+        line(
+            output,
+            indent,
+            &format!(
+                "let mut scratch_typed_{0} = {1}.number_or_nan();",
+                variable.slot,
+                variable.read_expression()
+            ),
+        );
+    }
+    for variable in numeric
+        .iter()
+        .filter(|variable| !needed.contains(&variable.slot))
+    {
+        line(
+            output,
+            indent,
+            &format!("let mut scratch_typed_{} = 0.0_f64;", variable.slot),
+        );
+    }
+}
+
+pub(super) fn emit_numeric_entry_guard(
+    output: &mut String,
+    indent: usize,
+    guards: &[&VariableInfo],
+) {
+    if guards.is_empty() {
+        return;
+    }
+    let pattern = guards
+        .iter()
+        .map(|variable| format!("Some(mut scratch_typed_{})", variable.slot))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = guards
+        .iter()
+        .map(|variable| format!("{}.canonical_number()", variable.read_expression()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    line(
+        output,
+        indent,
+        &format!("if let ({pattern},) = ({values},) {{"),
+    );
+}
+
+pub(super) fn emit_numeric_write_commit(
+    output: &mut String,
+    indent: usize,
+    variable: &VariableInfo,
+    deferred: &HashSet<usize>,
+) {
+    let slot = variable.slot;
+    let setter = if variable.is_stage {
+        "set_shared_number"
+    } else {
+        "set_local_number"
+    };
+    if deferred.contains(&slot) {
+        line(
+            output,
+            indent,
+            &format!(
+                "if scratch_defer_writes {{ scratch_dirty_{slot} = true; }} else {{ state.{setter}({slot}, scratch_typed_{slot}); }}"
+            ),
+        );
+    } else {
+        line(
+            output,
+            indent,
+            &format!("state.{setter}({slot}, scratch_typed_{slot});"),
+        );
+    }
+}
+
+pub(super) fn emit_typed_text_numeric_set(
+    output: &mut String,
+    indent: usize,
+    variable: &VariableInfo,
+    value: &str,
+    deferred: &HashSet<usize>,
+) {
+    let slot = variable.slot;
+    let setter = if variable.is_stage {
+        "set_shared"
+    } else {
+        "set_local_value"
+    };
+    line(
+        output,
+        indent,
+        &format!("scratch_typed_{slot} = {value}; scratch_text_{slot} = true;"),
+    );
+    if deferred.contains(&slot) {
+        line(
+            output,
+            indent,
+            &format!(
+                "if scratch_defer_writes {{ scratch_dirty_{slot} = true; }} else {{ state.{setter}({slot}, ScratchValue::Text(scratch_string(scratch_typed_{slot}))); }}"
+            ),
+        );
+    } else {
+        line(
+            output,
+            indent,
+            &format!(
+                "state.{setter}({slot}, ScratchValue::Text(scratch_string(scratch_typed_{slot})));"
+            ),
+        );
+    }
+}
+
+pub(super) fn emit_dynamic_write_commit(
+    output: &mut String,
+    indent: usize,
+    variable: &VariableInfo,
+) {
+    let setter = if variable.is_stage {
+        "set_shared"
+    } else {
+        "set_local_value"
+    };
+    line(
+        output,
+        indent,
+        &format!(
+            "if scratch_defer_writes {{ scratch_dynamic_dirty_{0} = true; }} else {{ state.{setter}({0}, scratch_dynamic_{0}.clone()); }}",
+            variable.slot
+        ),
+    );
+}
+
 pub(super) fn emit_typed_numeric_set(
     context: TypedNumericSetContext<'_>,
     block: &ScratchBlock,
@@ -257,31 +416,14 @@ pub(super) fn emit_typed_numeric_set(
         indent,
         &format!("scratch_typed_{} = {value};", variable.slot),
     );
-    if deferred.contains(&variable.slot) {
+    if deferred.contains(&variable.slot) && textual.contains(&variable.slot) {
         line(
             output,
             indent,
-            &format!("scratch_dirty_{} = true;", variable.slot),
-        );
-        if textual.contains(&variable.slot) {
-            line(
-                output,
-                indent,
-                &format!("scratch_text_{} = false;", variable.slot),
-            );
-        }
-    } else {
-        let setter = if variable.is_stage {
-            "set_shared_number"
-        } else {
-            "set_local_number"
-        };
-        line(
-            output,
-            indent,
-            &format!("state.{setter}({0}, scratch_typed_{0});", variable.slot),
+            &format!("scratch_text_{} = false;", variable.slot),
         );
     }
+    emit_numeric_write_commit(output, indent, variable, deferred);
 }
 
 // Track uses which require the original ScratchValue representation. A
@@ -919,9 +1061,7 @@ pub(super) fn emit_partial_structured_chain<'a>(
         } else if structured_sync_statement(&block.opcode) {
             let variable = variable_field(block, "VARIABLE", variables);
             let deferred_change = block.opcode == "data_changevariableby"
-                && variable
-                    .as_ref()
-                    .is_some_and(|v| deferred.contains(&v.slot));
+                && variable.as_ref().is_some_and(|v| numeric.contains(&v.slot));
             let typed_set = block.opcode == "data_setvariableto"
                 && variable.as_ref().is_some_and(|v| numeric.contains(&v.slot))
                 && definite_numeric_result(target, block.inputs.get("VALUE"));
@@ -963,14 +1103,7 @@ pub(super) fn emit_partial_structured_chain<'a>(
             } else if typed_text_set {
                 let variable = variable.as_ref().unwrap();
                 let value = canonical_constant(block.inputs.get("VALUE")).unwrap();
-                line(
-                    output,
-                    indent,
-                    &format!(
-                        "scratch_typed_{0} = {value}; scratch_text_{0} = true; scratch_dirty_{0} = true;",
-                        variable.slot
-                    ),
-                );
+                emit_typed_text_numeric_set(output, indent, variable, &value, deferred);
             } else if block.opcode == "data_replaceitemoflist" && !numeric.is_empty() {
                 emit_deferred_numeric_flush(output, indent, original_variables, deferred, textual);
                 let next = block
@@ -1020,13 +1153,6 @@ pub(super) fn emit_partial_structured_chain<'a>(
                                 variable.slot
                             ),
                         );
-                        if deferred_change {
-                            line(
-                                output,
-                                indent,
-                                &format!("scratch_dirty_{} = true;", variable.slot),
-                            );
-                        }
                         if deferred_change && textual.contains(&variable.slot) {
                             line(
                                 output,
@@ -1034,6 +1160,7 @@ pub(super) fn emit_partial_structured_chain<'a>(
                                 &format!("scratch_text_{} = false;", variable.slot),
                             );
                         }
+                        emit_numeric_write_commit(output, indent, &variable, deferred);
                     }
                     "data_setvariableto" => {
                         if !typed_set && !typed_text_set {
@@ -1279,18 +1406,12 @@ pub(super) fn emit_structured_loop_chain<'a>(
                         arguments,
                         &mut HashSet::new(),
                     );
-                    if is_borrowed_scratch_value_input(
-                        target,
-                        block.inputs.get("VALUE"),
-                        variables,
-                    ) {
+                    if is_borrowed_scratch_value_input(target, block.inputs.get("VALUE"), variables)
+                    {
                         line(
                             output,
                             indent,
-                            &format!(
-                                "scratch_dynamic_{0}.clone_from({value}); scratch_dynamic_dirty_{0} = true;",
-                                variable.slot
-                            ),
+                            &format!("scratch_dynamic_{0}.clone_from({value});", variable.slot),
                         );
                     } else {
                         line(
@@ -1303,12 +1424,10 @@ pub(super) fn emit_structured_loop_chain<'a>(
                         line(
                             output,
                             indent,
-                            &format!(
-                                "scratch_dynamic_{0} = scratch_new_value; scratch_dynamic_dirty_{0} = true;",
-                                variable.slot
-                            ),
+                            &format!("scratch_dynamic_{0} = scratch_new_value;", variable.slot),
                         );
                     }
+                    emit_dynamic_write_commit(output, indent, &variable);
                     cached_items.retain(|_, item| !item.index_slots.contains(&variable.slot));
                     cached_indexes.remove(&variable.slot);
                 } else if let Some(variable) = numeric_target
@@ -1338,14 +1457,7 @@ pub(super) fn emit_structured_loop_chain<'a>(
                     })
                 {
                     let value = canonical_constant(block.inputs.get("VALUE")).unwrap();
-                    line(
-                        output,
-                        indent,
-                        &format!(
-                            "scratch_typed_{0} = {value}; scratch_text_{0} = true; scratch_dirty_{0} = true;",
-                            variable.slot
-                        ),
-                    );
+                    emit_typed_text_numeric_set(output, indent, &variable, &value, deferred);
                     cached_items.retain(|_, item| !item.index_slots.contains(&variable.slot));
                     cached_indexes.remove(&variable.slot);
                 } else if let Some(slot) = emit_shared_list_copy(
@@ -1386,7 +1498,7 @@ pub(super) fn emit_structured_loop_chain<'a>(
             _ => {
                 let deferred_change = block.opcode == "data_changevariableby"
                     && variable_field(block, "VARIABLE", variables)
-                        .is_some_and(|v| deferred.contains(&v.slot));
+                        .is_some_and(|v| numeric_locals.contains(&v.slot));
                 if deferred_change {
                     let value = expression(
                         target,
@@ -1452,13 +1564,6 @@ pub(super) fn emit_structured_loop_chain<'a>(
                                 variable.slot
                             ),
                         );
-                        if deferred_change {
-                            line(
-                                output,
-                                indent,
-                                &format!("scratch_dirty_{} = true;", variable.slot),
-                            );
-                        }
                         if deferred_change && textual.contains(&variable.slot) {
                             line(
                                 output,
@@ -1466,6 +1571,7 @@ pub(super) fn emit_structured_loop_chain<'a>(
                                 &format!("scratch_text_{} = false;", variable.slot),
                             );
                         }
+                        emit_numeric_write_commit(output, indent, &variable, deferred);
                     }
                     if let Some(variable) = variable_field(block, "VARIABLE", variables) {
                         cached_indexes.remove(&variable.slot);

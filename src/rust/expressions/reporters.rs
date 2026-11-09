@@ -287,15 +287,12 @@ pub(super) fn block_expression(
         }
         "data_itemoflist" => list_field(block, "LIST", lists)
             .map(|list| {
-                let method = if comparison_input_is_numeric(
-                    target,
-                    block.inputs.get("INDEX"),
-                    variables,
-                ) {
-                    "get_numeric"
-                } else {
-                    "get"
-                };
+                let method =
+                    if comparison_input_is_numeric(target, block.inputs.get("INDEX"), variables) {
+                        "get_numeric"
+                    } else {
+                        "get"
+                    };
                 format!(
                     "{}.{method}({})",
                     list.read_expression(),

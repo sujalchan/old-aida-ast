@@ -489,14 +489,25 @@ pub(super) fn generate_numeric_direct(
     }
     for (slot, variable) in &compiler.all {
         if compiler.needed.contains_key(slot) {
-            line(
-                &mut output,
-                1,
-                &format!(
-                    "let Some(mut numeric_{slot}) = {}.canonical_number() else {{ {fallback} }};",
-                    variable.read_expression()
-                ),
-            );
+            if variable.numeric {
+                line(
+                    &mut output,
+                    1,
+                    &format!(
+                        "let mut numeric_{slot} = {}.number_or_nan();",
+                        variable.read_expression()
+                    ),
+                );
+            } else {
+                line(
+                    &mut output,
+                    1,
+                    &format!(
+                        "let Some(mut numeric_{slot}) = {}.canonical_number() else {{ {fallback} }};",
+                        variable.read_expression()
+                    ),
+                );
+            }
         } else {
             line(
                 &mut output,

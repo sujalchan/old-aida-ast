@@ -338,6 +338,75 @@ fn structured_loop_merges_nested_numeric_branches_and_commits_before_yield() {
     assert_eq!(count_resumable_pc_arms(&output), 2);
 }
 
+#[test]
+fn structured_loop_uses_numeric_codegen_when_type_is_proven_even_if_nan_is_possible() {
+    let project = parse_project(
+        &json!({
+            "targets": [{
+                "name": "Sprite1", "isStage": false,
+                "variables": {"counter": ["counter", 0], "flag": ["flag", 0]},
+                "blocks": {
+                    "hat": {"opcode":"event_whenflagclicked", "next":"repeat", "topLevel":true},
+                    "repeat": {"opcode":"control_repeat", "parent":"hat", "inputs":{"TIMES":[1,[4,"20"]],"SUBSTACK":[2,"if"]}},
+                    "if": {"opcode":"control_if_else", "parent":"repeat", "next":"change", "inputs":{"CONDITION":[2,"equal"],"SUBSTACK":[2,"yes"],"SUBSTACK2":[2,"no"]}},
+                    "equal": {"opcode":"operator_equals", "parent":"if", "inputs":{"OPERAND1":[3,[12,"flag","flag"],[4,"0"]],"OPERAND2":[1,[4,"0"]]}},
+                    "yes": {"opcode":"data_setvariableto", "parent":"if", "inputs":{"VALUE":[1,[4,"1"]]}, "fields":{"VARIABLE":["flag","flag"]}},
+                    "no": {"opcode":"data_setvariableto", "parent":"if", "inputs":{"VALUE":[1,[4,"0"]]}, "fields":{"VARIABLE":["flag","flag"]}},
+                    "change": {"opcode":"data_changevariableby", "parent":"repeat", "inputs":{"VALUE":[1,[4,"1"]]}, "fields":{"VARIABLE":["counter","counter"]}},
+                    "nan_hat": {"opcode":"event_whenkeypressed", "next":"set_nan", "topLevel":true, "fields":{"KEY_OPTION":["space",null]}},
+                    "set_nan": {"opcode":"data_setvariableto", "parent":"nan_hat", "inputs":{"VALUE":[3,"divide"]}, "fields":{"VARIABLE":["counter","counter"]}},
+                    "divide": {"opcode":"operator_divide", "parent":"set_nan", "inputs":{"NUM1":[1,[4,"0"]],"NUM2":[1,[4,"0"]]}}
+                }
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = generate(&project);
+
+    assert!(output.contains("number_or_nan()"));
+    assert!(!output.contains("canonical_number()"));
+    assert!(!output.contains("state.change_local_number("));
+    assert!(output.contains("let scratch_defer_writes = state.can_defer_variable_writes("));
+    assert!(output.contains("if scratch_defer_writes { scratch_dirty_"));
+    assert!(output.contains("else { state.set_local_number("));
+}
+
+#[test]
+fn structured_loop_keeps_a_dynamic_fallback_for_variables_written_as_text_elsewhere() {
+    let project = parse_project(
+        &json!({
+            "targets": [{
+                "name": "Sprite1", "isStage": false,
+                "variables": {"counter": ["counter", 0], "flag": ["flag", 0]},
+                "blocks": {
+                    "hat": {"opcode":"event_whenflagclicked", "next":"repeat", "topLevel":true},
+                    "repeat": {"opcode":"control_repeat", "parent":"hat", "inputs":{"TIMES":[1,[4,"20"]],"SUBSTACK":[2,"if"]}},
+                    "if": {"opcode":"control_if_else", "parent":"repeat", "next":"change", "inputs":{"CONDITION":[2,"equal"],"SUBSTACK":[2,"yes"],"SUBSTACK2":[2,"no"]}},
+                    "equal": {"opcode":"operator_equals", "parent":"if", "inputs":{"OPERAND1":[3,[12,"flag","flag"],[4,"0"]],"OPERAND2":[1,[4,"0"]]}},
+                    "yes": {"opcode":"data_setvariableto", "parent":"if", "inputs":{"VALUE":[1,[4,"1"]]}, "fields":{"VARIABLE":["flag","flag"]}},
+                    "no": {"opcode":"data_setvariableto", "parent":"if", "inputs":{"VALUE":[1,[4,"0"]]}, "fields":{"VARIABLE":["flag","flag"]}},
+                    "change": {"opcode":"data_changevariableby", "parent":"repeat", "inputs":{"VALUE":[1,[4,"1"]]}, "fields":{"VARIABLE":["counter","counter"]}},
+                    "other_hat": {"opcode":"event_whenkeypressed", "next":"set_text", "topLevel":true, "fields":{"KEY_OPTION":["space",null]}},
+                    "set_text": {"opcode":"data_setvariableto", "parent":"other_hat", "inputs":{"VALUE":[1,[10,"text"]]}, "fields":{"VARIABLE":["counter","counter"]}}
+                }
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = generate(&project);
+
+    assert!(output.contains("canonical_number()"));
+    assert!(output.contains("state.change_local_number("));
+    let guard = output
+        .lines()
+        .find(|line| line.contains("canonical_number()") && line.contains("if let"))
+        .unwrap();
+    assert!(!guard.contains("can_defer_variable_writes"));
+    assert!(output.contains("let scratch_defer_writes = state.can_defer_variable_writes("));
+}
+
 fn count_resumable_pc_arms(source: &str) -> usize {
     source
         .lines()
