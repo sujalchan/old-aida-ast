@@ -212,6 +212,68 @@ fn item_replace_fixture_uses_guarded_numeric_list_paths() {
 }
 
 #[test]
+fn custom_block_warp_raster_copy_keeps_numeric_indices_in_native_locals() {
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/src/custom-block-warps.sb3"
+    );
+    let json = crate::extractor::read_project_json(input).unwrap();
+    let project = parse_project(&json).unwrap();
+    let output = generate(&project);
+
+    assert!(output.contains(
+        "state.copy_list_item_numeric::<5, 1, false, false, false>(scratch_source_index, scratch_destination_index)"
+    ));
+    assert!(output.contains("state.stage_list_mut(3).replace_number("));
+    assert!(output.contains("state.list_changed_result(3, scratch_list_changed);"));
+    assert!(output.contains("get_number_numeric(scratch_list_index)"));
+    assert!(output.contains("get_number_for_arithmetic("));
+    assert!(output.contains(
+        "scratch_greater_than(left, state.stage_list(3).get_numeric(scratch_list_index))"
+    ));
+    assert!(output.contains(
+        "script.push_numeric_frame(87439061, 0, smallvec::smallvec![0; 0], smallvec::smallvec![state.get(98).number_or_nan()"
+    ));
+    let mut split_tri = String::new();
+    let mut in_split_tri = false;
+    for line in output.lines() {
+        if line.starts_with("fn step_procedures_1_partition_") {
+            let is_split_tri = line.starts_with("fn step_procedures_1_partition_87439061_");
+            if in_split_tri && !is_split_tri {
+                break;
+            }
+            in_split_tri = is_split_tri;
+        }
+        if in_split_tri {
+            split_tri.push_str(line);
+            split_tri.push('\n');
+        }
+    }
+    assert!(
+        !split_tri.is_empty(),
+        "split_tri should have a generated procedure body"
+    );
+    assert!(split_tri.contains("script.numeric_argument(0)"));
+    assert!(split_tri.contains("script.numeric_argument(14)"));
+    assert!(!split_tri.contains("script.argument("));
+    assert!(output.contains("script.push_frame("));
+    assert!(output.contains("script.argument("));
+    assert!(!output.contains("scratch_list_item: ScratchValue = state.list(5)"));
+    let copy = output
+        .find("state.copy_list_item_numeric::<5, 1, false, false, false>(scratch_source_index, scratch_destination_index)")
+        .expect("raster copies should use the numeric source index");
+    let branch_start = output[..copy]
+        .rfind("if { let left = scratch_typed_113;")
+        .expect("copy should remain in the depth comparison branch");
+    let branch = &output[branch_start..copy];
+    assert!(!branch.contains("state.list_changed_result(1, scratch_list_changed);"));
+    assert!(!branch.contains("state.set_local_number(15, scratch_typed_15)"));
+    assert!(!branch.contains("state.set_local_number(29, scratch_typed_29)"));
+    assert!(!branch.contains("state.set_local_number(37, scratch_typed_37)"));
+    assert!(!branch.contains("state.set_local_number(113, scratch_typed_113)"));
+}
+
+#[test]
 fn replacement_batch_rejects_branch_that_reads_the_list() {
     let input = concat!(
         env!("CARGO_MANIFEST_DIR"),

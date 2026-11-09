@@ -94,10 +94,11 @@ pub(super) fn generate_green_flag_functions(
     };
     let glide_initializer = if uses_glide { ", glide: None" } else { "" };
     output.push_str(&format!(
-        "#[allow(dead_code)]\nstruct ProcedureFrame {{ function: usize, pc: usize, repeat_counts: Vec<usize>, arguments: Vec<ScratchValue>, warp_mode: bool{glide_field} }}\nimpl ProcedureFrame {{ fn new(function: usize, pc: usize, repeat_counts: Vec<usize>, arguments: Vec<ScratchValue>, warp_mode: bool) -> Self {{ Self {{ function, pc, repeat_counts, arguments, warp_mode{glide_initializer} }} }} }}\n"
+        "#[allow(dead_code)]\nstruct ProcedureFrame {{ function: usize, pc: usize, repeat_counts: smallvec::SmallVec<[usize; 4]>, argument_start: usize, argument_count: usize, numeric_argument_start: usize, numeric_argument_count: usize, numeric_only_arguments: bool, warp_mode: bool{glide_field} }}\nimpl ProcedureFrame {{ fn new(function: usize, pc: usize, repeat_counts: smallvec::SmallVec<[usize; 4]>, argument_start: usize, argument_count: usize, numeric_argument_start: usize, numeric_argument_count: usize, numeric_only_arguments: bool, warp_mode: bool) -> Self {{ Self {{ function, pc, repeat_counts, argument_start, argument_count, numeric_argument_start, numeric_argument_count, numeric_only_arguments, warp_mode{glide_initializer} }} }} }}\n"
     ));
-    output
-        .push_str("struct ScriptState { frames: Vec<ProcedureFrame>, __WARP_BUDGET_FIELD__ }\n\n");
+    output.push_str(
+        "struct ScriptState { frames: Vec<ProcedureFrame>, arguments: Vec<ScratchValue>, numeric_arguments: Vec<f64>, __WARP_BUDGET_FIELD__ }\n\n",
+    );
     line(output, 0, "enum GeneratedScript {");
     for script in &scripts {
         line(
@@ -388,6 +389,8 @@ pub(super) fn generate_green_flag_functions(
                     no_warp_timer,
                     reachable_procedure_ids: procedure_plan.reachable_ids().clone(),
                     numeric_call_procedure_ids: procedure_plan.numeric_call_procedure_ids().clone(),
+                    numeric_arguments: procedure_plan.numeric_arguments().clone(),
+                    numeric_warp_procedure_ids: procedure_plan.numeric_warp_procedure_ids().clone(),
                 },
                 output,
             );
@@ -403,7 +406,7 @@ pub(super) fn generate_green_flag_functions(
             output,
             0,
             &format!(
-                "fn new_{}_for(instance: usize) -> GeneratedScript {{ GeneratedScript::{}(instance, ScriptState {{ frames: vec![ProcedureFrame::new(0, {}, vec![0; {loop_count}], vec![], false)], __WARP_BUDGET_INIT__ }}) }}\n",
+                "fn new_{}_for(instance: usize) -> GeneratedScript {{ GeneratedScript::{}(instance, ScriptState {{ frames: vec![ProcedureFrame::new(0, {}, smallvec::smallvec![0; {loop_count}], 0, 0, 0, 0, false, false)], arguments: Vec::new(), numeric_arguments: Vec::new(), __WARP_BUDGET_INIT__ }}) }}\n",
                 script.function,
                 script.variant,
                 if start_pc == usize::MAX {

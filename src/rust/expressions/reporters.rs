@@ -1,5 +1,120 @@
 use super::*;
 
+struct ArithmeticNumericInput {
+    code: String,
+    normalize_nan: bool,
+}
+
+fn arithmetic_numeric_input(
+    target: &ScratchTarget,
+    input: Option<&Value>,
+    variables: &HashMap<String, VariableInfo>,
+    lists: &HashMap<String, ListInfo>,
+    arguments: &HashMap<String, String>,
+    active: &mut HashSet<String>,
+) -> Option<ArithmeticNumericInput> {
+    match input.and_then(parse_input)? {
+        InputValue::Number(value) => Some(ArithmeticNumericInput {
+            code: number_literal(value),
+            normalize_nan: false,
+        }),
+        InputValue::VariableReference(reference) => {
+            let variable =
+                super::super::project::variable_for_target(target, reference.id, variables)?;
+            arithmetic_numeric_variable(variable).map(|code| ArithmeticNumericInput {
+                code,
+                normalize_nan: true,
+            })
+        }
+        InputValue::BlockReference(id) => {
+            let reporter = target.blocks.get(id)?;
+            match reporter.opcode.as_str() {
+                "data_variable" => {
+                    let variable = variable_field(reporter, "VARIABLE", variables)?;
+                    arithmetic_numeric_variable(&variable).map(|code| ArithmeticNumericInput {
+                        code,
+                        normalize_nan: true,
+                    })
+                }
+                "argument_reporter_string_number" | "argument_reporter_boolean" => {
+                    let name = field_value(reporter, "VALUE")?.as_str()?;
+                    let value = arguments.get(name)?;
+                    (value.starts_with("__aida_numeric_arg_")
+                        || value.starts_with("numeric_argument_"))
+                    .then(|| ArithmeticNumericInput {
+                        code: value.clone(),
+                        normalize_nan: true,
+                    })
+                }
+                "data_itemoflist" => {
+                    let list = list_field(reporter, "LIST", lists)?;
+                    let index = expression(
+                        target,
+                        reporter.inputs.get("INDEX"),
+                        variables,
+                        lists,
+                        arguments,
+                        active,
+                    );
+                    Some(ArithmeticNumericInput {
+                        code: format!(
+                            "{}.get_number_for_arithmetic({index})",
+                            list.read_expression()
+                        ),
+                        normalize_nan: false,
+                    })
+                }
+                // These reporters always return f64. They may coerce dynamic
+                // inputs internally, but the outer arithmetic needs no value
+                // type dispatch once their result has been produced.
+                "operator_add"
+                | "operator_subtract"
+                | "operator_multiply"
+                | "operator_divide"
+                | "operator_mod"
+                | "operator_round"
+                | "operator_random"
+                | "operator_mathop"
+                | "data_lengthoflist"
+                | "data_itemnumoflist"
+                | "math_number"
+                | "math_integer"
+                | "math_whole_number"
+                | "math_positive_number"
+                | "math_angle"
+                | "motion_xposition"
+                | "motion_yposition"
+                | "motion_direction"
+                | "looks_size"
+                | "sound_volume"
+                | "sensing_mousex"
+                | "sensing_mousey"
+                | "sensing_timer"
+                | "sensing_dayssince2000"
+                | "sensing_loudness" => Some(ArithmeticNumericInput {
+                    code: expression(target, input, variables, lists, arguments, active),
+                    normalize_nan: true,
+                }),
+                _ => None,
+            }
+        }
+        // A literal string still needs Scratch's ordinary numeric coercion.
+        // Keep it on the dynamic conversion path rather than assuming its type.
+        InputValue::String(_) | InputValue::Empty | InputValue::ListReference(_) => None,
+    }
+}
+
+fn arithmetic_numeric_variable(variable: &VariableInfo) -> Option<String> {
+    if let Some(value) = &variable.index_read_override {
+        if value.starts_with("scratch_typed_") {
+            return Some(value.clone());
+        }
+        return None;
+    }
+    (variable.numeric && !variable.monitor_visible)
+        .then(|| format!("{}.number_or_nan()", variable.read_expression()))
+}
+
 pub(super) fn list_field(
     block: &ScratchBlock,
     field: &str,
@@ -76,37 +191,38 @@ pub(super) fn block_expression(
     // A list selected for cached numeric reads still owns its original dynamic
     // values; the runtime invalidates the cache when the list changes.
     let numeric_input = |name: &str, active: &mut HashSet<String>| {
-        let candidate = block
-            .inputs
-            .get(name)
-            .and_then(parse_input)
-            .and_then(|input| match input {
-                InputValue::BlockReference(id) => target.blocks.get(id),
-                _ => None,
-            })
-            .filter(|reporter| reporter.opcode == "data_itemoflist");
-        if let Some(reporter) = candidate
-            && let Some(list) =
-                list_field(reporter, "LIST", lists).filter(|list| list.cache_numeric_reads)
-        {
-            let index = expression(
-                target,
-                reporter.inputs.get("INDEX"),
-                variables,
-                lists,
-                arguments,
-                active,
-            );
-            return format!("{}.get_cached_number({index})", list.read_expression());
-        }
-        input(name, active)
-    };
-    let numeric_binary = |function: &str, active: &mut HashSet<String>| {
-        format!(
-            "{function}({}, {})",
-            numeric_input("NUM1", active),
-            numeric_input("NUM2", active)
+        arithmetic_numeric_input(
+            target,
+            block.inputs.get(name),
+            variables,
+            lists,
+            arguments,
+            active,
         )
+    };
+    let numeric_binary = |function: &str, operator: &str, active: &mut HashSet<String>| {
+        let left = numeric_input("NUM1", active);
+        let right = numeric_input("NUM2", active);
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                let left = if left.normalize_nan {
+                    format!("scratch_number_operand({})", left.code)
+                } else {
+                    left.code
+                };
+                let right = if right.normalize_nan {
+                    format!("scratch_number_operand({})", right.code)
+                } else {
+                    right.code
+                };
+                format!("({left} {operator} {right})")
+            }
+            _ => format!(
+                "{function}({}, {})",
+                input("NUM1", active),
+                input("NUM2", active)
+            ),
+        }
     };
     if matches!(
         block.opcode.as_str(),
@@ -186,9 +302,22 @@ pub(super) fn block_expression(
             && !right_numeric
             && comparison_input_is_value_ref(target, block.inputs.get("OPERAND2"), variables)
         {
-            format!(
-                "{{ let left = {left}; let right = {right}; match right {{ ScratchValue::Number(number) if !left.is_nan() && !number.is_nan() => left {op} *number, _ => {function}(left, right) }} }}"
+            numeric_list_item_comparison(
+                target,
+                block.inputs.get("OPERAND2"),
+                &left,
+                function,
+                op,
+                variables,
+                lists,
+                arguments,
+                active,
             )
+            .unwrap_or_else(|| {
+                format!(
+                    "{{ let left = {left}; let right = {right}; match right {{ ScratchValue::Number(number) if !left.is_nan() && !number.is_nan() => left {op} *number, _ => {function}(left, right) }} }}"
+                )
+            })
         } else if !left_numeric
             && !right_numeric
             && comparison_input_is_value_ref(target, block.inputs.get("OPERAND1"), variables)
@@ -202,10 +331,10 @@ pub(super) fn block_expression(
         }
     };
     match block.opcode.as_str() {
-        "operator_add" => numeric_binary("scratch_add", active),
-        "operator_subtract" => numeric_binary("scratch_subtract", active),
-        "operator_multiply" => numeric_binary("scratch_multiply", active),
-        "operator_divide" => numeric_binary("scratch_divide", active),
+        "operator_add" => numeric_binary("scratch_add", "+", active),
+        "operator_subtract" => numeric_binary("scratch_subtract", "-", active),
+        "operator_multiply" => numeric_binary("scratch_multiply", "*", active),
+        "operator_divide" => numeric_binary("scratch_divide", "/", active),
         "operator_mod" => binary("scratch_mod", "NUM1", "NUM2", active),
         "operator_equals" if identical_literal_inputs(block) => "true".to_owned(),
         "operator_equals" => numeric_list_equality(target, block, variables, lists)
@@ -391,6 +520,39 @@ pub(super) fn block_expression(
             .unwrap_or_else(|| unsupported_expression("missing text field")),
         opcode => unsupported_expression(&format!("unsupported reporter: {opcode}")),
     }
+}
+
+fn numeric_list_item_comparison(
+    target: &ScratchTarget,
+    input: Option<&Value>,
+    left: &str,
+    function: &str,
+    operator: &str,
+    variables: &HashMap<String, VariableInfo>,
+    lists: &HashMap<String, ListInfo>,
+    arguments: &HashMap<String, String>,
+    active: &mut HashSet<String>,
+) -> Option<String> {
+    let InputValue::BlockReference(id) = input.and_then(parse_input)? else {
+        return None;
+    };
+    let reporter = target.blocks.get(id)?;
+    if reporter.opcode != "data_itemoflist" {
+        return None;
+    }
+    let list = list_field(reporter, "LIST", lists)?;
+    let list_expression = list.read_expression();
+    let index = expression(
+        target,
+        reporter.inputs.get("INDEX"),
+        variables,
+        lists,
+        arguments,
+        active,
+    );
+    Some(format!(
+        "{{ let left = {left}; let scratch_list_index = {index}; match {list_expression}.get_number_numeric(scratch_list_index) {{ Some(right) if !left.is_nan() && !right.is_nan() => left {operator} right, _ => {function}(left, {list_expression}.get_numeric(scratch_list_index)) }} }}"
+    ))
 }
 
 fn sensing_of_expression(

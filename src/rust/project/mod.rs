@@ -40,6 +40,7 @@ pub(super) struct VariableInfo {
     pub(super) target_index: usize,
     pub(super) target_variable_order: usize,
     pub(super) numeric: bool,
+    pub(super) canonical_numeric: bool,
     pub(super) non_nan: bool,
     pub(super) monitor_visible: bool,
     pub(super) index_read_override: Option<String>,
@@ -112,6 +113,7 @@ pub(super) struct ListInfo {
     pub(super) is_stage: bool,
     pub(super) target_index: usize,
     pub(super) cache_numeric_reads: bool,
+    pub(super) monitor_possible: bool,
 }
 
 impl ListInfo {
@@ -646,7 +648,7 @@ fn generate_internal(
         }
     };
     let frame_accessors = if uses_frame_accessors {
-        "\nimpl ScriptState {\n    #[inline(always)]\n    fn frame(&self) -> &ProcedureFrame { self.frames.last().unwrap() }\n    #[inline(always)]\n    fn frame_mut(&mut self) -> &mut ProcedureFrame { self.frames.last_mut().unwrap() }\n}\n"
+        "\nimpl ScriptState {\n    #[inline(always)]\n    fn frame(&self) -> &ProcedureFrame { self.frames.last().unwrap() }\n    #[inline(always)]\n    fn frame_mut(&mut self) -> &mut ProcedureFrame { self.frames.last_mut().unwrap() }\n    #[inline(always)]\n    fn argument(&self, index: usize) -> &ScratchValue { let frame = self.frame(); debug_assert!(!frame.numeric_only_arguments && index < frame.argument_count); &self.arguments[frame.argument_start + index] }\n    #[inline(always)]\n    fn numeric_argument(&self, index: usize) -> f64 { let frame = self.frame(); debug_assert!(frame.numeric_only_arguments && index < frame.numeric_argument_count); self.numeric_arguments[frame.numeric_argument_start + index] }\n    #[inline(always)]\n    fn push_frame(&mut self, function: usize, pc: usize, repeat_counts: smallvec::SmallVec<[usize; 4]>, arguments: smallvec::SmallVec<[ScratchValue; 16]>, warp_mode: bool) { let argument_start = self.arguments.len(); let argument_count = arguments.len(); self.arguments.extend(arguments); self.frames.push(ProcedureFrame::new(function, pc, repeat_counts, argument_start, argument_count, 0, 0, false, warp_mode)); }\n    #[inline(always)]\n    fn push_numeric_frame(&mut self, function: usize, pc: usize, repeat_counts: smallvec::SmallVec<[usize; 4]>, arguments: smallvec::SmallVec<[f64; 16]>, warp_mode: bool) { let numeric_argument_start = self.numeric_arguments.len(); let numeric_argument_count = arguments.len(); self.numeric_arguments.extend(arguments); self.frames.push(ProcedureFrame::new(function, pc, repeat_counts, 0, 0, numeric_argument_start, numeric_argument_count, true, warp_mode)); }\n    #[inline(always)]\n    fn pop_frame(&mut self) -> Option<ProcedureFrame> { let frame = self.frames.pop()?; if frame.numeric_only_arguments { self.numeric_arguments.truncate(frame.numeric_argument_start); } else { self.arguments.truncate(frame.argument_start); } Some(frame) }\n}\n"
     } else {
         ""
     };
@@ -666,8 +668,12 @@ fn compact_resumable_state_source(source: &str) -> (String, bool, bool, bool) {
     let mut output = String::with_capacity(source.len());
     let mut uses_pc_setter = false;
     let mut uses_pc_transition = false;
-    let mut uses_frame_accessors =
-        source.contains("script.frame()") || source.contains("script.frame_mut()");
+    let mut uses_frame_accessors = source.contains("script.frame()")
+        || source.contains("script.frame_mut()")
+        || source.contains("script.push_frame(")
+        || source.contains("script.push_numeric_frame(")
+        || source.contains("script.numeric_argument(")
+        || source.contains("script.pop_frame()");
     let lines = source.split_inclusive('\n').collect::<Vec<_>>();
     let mut index = 0;
     while index < lines.len() {

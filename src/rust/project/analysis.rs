@@ -55,6 +55,7 @@ pub(super) fn rust_identifiers(source: &str) -> HashSet<String> {
 // assign each Scratch variable ID a stable shared-state slot.
 pub(super) fn allocate_variables(project: &ScratchProject) -> HashMap<String, VariableInfo> {
     let numeric_variables = numeric_variables(project);
+    let canonical_numeric_variables = canonical_numeric_variables(project);
     let non_nan_variables = non_nan_variables(project);
     let mut entries = BTreeMap::new();
     for (target_index, target) in project.targets.iter().enumerate() {
@@ -88,6 +89,8 @@ pub(super) fn allocate_variables(project: &ScratchProject) -> HashMap<String, Va
                     target_index,
                     target_variable_order,
                     numeric: numeric_variables.contains(&variable_key(target_index, id)),
+                    canonical_numeric: canonical_numeric_variables
+                        .contains(&variable_key(target_index, id)),
                     non_nan: non_nan_variables.contains(&variable_key(target_index, id)),
                     monitor_visible,
                     index_read_override: None,
@@ -271,6 +274,116 @@ pub(super) fn numeric_variables(project: &ScratchProject) -> HashSet<String> {
     }
 }
 
+/// Prove that a value is either a Number or canonical numeric text. This is
+/// sufficient for numeric execution that preserves Scratch's comparison text,
+/// while keeping arbitrary strings on the dynamic path.
+pub(super) fn canonical_numeric_variables(project: &ScratchProject) -> HashSet<String> {
+    let mut canonical_numeric = HashSet::new();
+    for (target_index, target) in project.targets.iter().enumerate() {
+        for (id, variable) in &target.variables {
+            if !variable.is_cloud
+                && (variable.value.is_number()
+                    || variable
+                        .value
+                        .as_str()
+                        .is_some_and(is_canonical_integer_text))
+            {
+                canonical_numeric.insert(variable_key(target_index, id));
+            }
+        }
+    }
+
+    loop {
+        let previous = canonical_numeric.clone();
+        for target in &project.targets {
+            for block in target.blocks.values() {
+                if block.opcode != "data_setvariableto" {
+                    continue;
+                }
+                let Some(id) = block
+                    .fields
+                    .get("VARIABLE")
+                    .and_then(|field| field.as_array())
+                    .and_then(|field| field.get(1))
+                    .and_then(|id| id.as_str())
+                else {
+                    continue;
+                };
+                if !input_is_canonical_numeric(
+                    target,
+                    block.inputs.get("VALUE"),
+                    &previous,
+                    &mut HashSet::new(),
+                ) {
+                    canonical_numeric.remove(&variable_key_for_target(target, id));
+                }
+            }
+        }
+        if canonical_numeric == previous {
+            return canonical_numeric;
+        }
+    }
+}
+
+fn input_is_canonical_numeric(
+    target: &ScratchTarget,
+    input: Option<&serde_json::Value>,
+    canonical_numeric: &HashSet<String>,
+    active: &mut HashSet<String>,
+) -> bool {
+    match input.and_then(parse_input) {
+        Some(InputValue::Number(_)) => true,
+        Some(InputValue::String(value)) => value.as_str().is_some_and(is_canonical_integer_text),
+        Some(InputValue::VariableReference(reference)) => {
+            canonical_numeric.contains(&variable_key_for_target(target, reference.id))
+        }
+        Some(InputValue::BlockReference(id)) => {
+            if !active.insert(id.to_owned()) {
+                return false;
+            }
+            let result = target
+                .blocks
+                .get(id)
+                .is_some_and(|block| match block.opcode.as_str() {
+                    "data_variable" => block
+                        .fields
+                        .get("VARIABLE")
+                        .and_then(|field| field.as_array())
+                        .and_then(|field| field.get(1))
+                        .and_then(|id| id.as_str())
+                        .is_some_and(|id| {
+                            canonical_numeric.contains(&variable_key_for_target(target, id))
+                        }),
+                    "operator_add"
+                    | "operator_subtract"
+                    | "operator_multiply"
+                    | "operator_divide"
+                    | "operator_mod"
+                    | "operator_round"
+                    | "operator_random"
+                    | "operator_mathop"
+                    | "data_lengthoflist"
+                    | "data_itemnumoflist"
+                    | "math_number"
+                    | "math_integer"
+                    | "math_whole_number"
+                    | "math_positive_number"
+                    | "math_angle" => true,
+                    _ => false,
+                });
+            active.remove(id);
+            result
+        }
+        _ => false,
+    }
+}
+
+fn is_canonical_integer_text(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|number| number.to_string() == value)
+}
+
 pub(super) fn input_is_numeric(
     target: &ScratchTarget,
     input: Option<&serde_json::Value>,
@@ -333,32 +446,29 @@ pub(super) fn allocate_lists(project: &ScratchProject) -> HashMap<String, ListIn
         .filter_map(|block| block.fields.get("LIST")?.as_array()?.get(1)?.as_str())
         .collect::<HashSet<_>>();
     let mut entries = BTreeMap::new();
-    for target in &project.targets {
+    for (target_index, target) in project.targets.iter().enumerate() {
         for (id, list) in &target.lists {
+            let monitor_possible = project.monitors.iter().any(|monitor| {
+                monitor.opcode == "data_listcontents"
+                    && monitor.id == *id
+                    && monitor_list_target_index(project, monitor) == Some(target_index)
+            });
             let info = entries.entry(id.clone()).or_insert_with(|| ListInfo {
                 slot: 0,
                 name: list.name.clone(),
                 target: target.name.clone(),
                 is_stage: target.is_stage,
-                target_index: project
-                    .targets
-                    .iter()
-                    .position(|candidate| {
-                        candidate.name == target.name && candidate.is_stage == target.is_stage
-                    })
-                    .unwrap_or(0),
+                target_index,
                 cache_numeric_reads: list.items.len() >= 1024
                     && !written_lists.contains(id.as_str()),
+                monitor_possible,
             });
+            info.monitor_possible |= monitor_possible;
             if target.is_stage {
                 info.name = list.name.clone();
                 info.target = target.name.clone();
                 info.is_stage = true;
-                info.target_index = project
-                    .targets
-                    .iter()
-                    .position(|candidate| candidate.is_stage)
-                    .unwrap_or(0);
+                info.target_index = target_index;
             }
         }
     }
@@ -368,6 +478,25 @@ pub(super) fn allocate_lists(project: &ScratchProject) -> HashMap<String, ListIn
         output.insert(id, info);
     }
     output
+}
+
+fn monitor_list_target_index(
+    project: &ScratchProject,
+    monitor: &crate::parser::ScratchMonitor,
+) -> Option<usize> {
+    let target_index = monitor.sprite_name.as_deref().map_or_else(
+        || project.targets.iter().position(|target| target.is_stage),
+        |sprite_name| {
+            project
+                .targets
+                .iter()
+                .position(|target| target.name == sprite_name)
+        },
+    )?;
+    project.targets[target_index]
+        .lists
+        .contains_key(&monitor.id)
+        .then_some(target_index)
 }
 
 #[cfg(test)]

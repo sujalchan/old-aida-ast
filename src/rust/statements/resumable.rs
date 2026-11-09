@@ -25,6 +25,16 @@ pub(in crate::rust) struct ResumableProcedurePlan {
     entries: HashMap<String, ProcedureEntry>,
     reachable: HashSet<String>,
     numeric_call_procedures: HashSet<String>,
+    numeric_arguments: HashMap<String, Vec<bool>>,
+    numeric_frame_arguments: HashMap<String, Vec<bool>>,
+    numeric_warp_procedures: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct ProcedureCallSite {
+    block_id: String,
+    caller_id: Option<String>,
+    callee_id: String,
 }
 
 const RESUMABLE_PARTITION_THRESHOLD_BYTES: usize = 12 * 1024;
@@ -40,8 +50,7 @@ struct GeneratedStateArm {
 struct GeneratedStatePartition {
     function_id: usize,
     index: usize,
-    first_pc: usize,
-    last_pc: usize,
+    pcs: Vec<usize>,
     arms: Vec<GeneratedStateArm>,
 }
 
@@ -56,65 +65,285 @@ fn partition_generated_state_arms(
         return None;
     }
 
-    let mut arms = source_arms.to_vec();
-    arms.sort_by_key(|arm| (arm.function_id, arm.pc));
-    let mut partitions = Vec::new();
-    let mut current_arms: Vec<GeneratedStateArm> = Vec::new();
-    let mut current_bytes = 0;
-    let mut current_function = None;
-    let mut partition_index = 0;
-
-    for arm in arms {
-        if !current_arms.is_empty()
-            && (current_function != Some(arm.function_id)
-                || current_bytes + arm.source.len() > RESUMABLE_PARTITION_TARGET_BYTES)
-        {
-            let first_pc = current_arms.first().unwrap().pc;
-            let last_pc = current_arms.last().unwrap().pc;
-            partitions.push(GeneratedStatePartition {
-                function_id: current_function.unwrap(),
-                index: partition_index,
-                first_pc,
-                last_pc,
-                arms: std::mem::take(&mut current_arms),
-            });
-            current_bytes = 0;
-            partition_index += 1;
-        }
-        if current_function != Some(arm.function_id) {
-            current_function = Some(arm.function_id);
-            partition_index = 0;
-        }
-        current_bytes += arm.source.len();
-        current_arms.push(arm);
-
-        // Keep an individually large PC arm intact and alone in its worker.
-        if current_bytes >= RESUMABLE_PARTITION_TARGET_BYTES {
-            let first_pc = current_arms.first().unwrap().pc;
-            let last_pc = current_arms.last().unwrap().pc;
-            partitions.push(GeneratedStatePartition {
-                function_id: current_function.unwrap(),
-                index: partition_index,
-                first_pc,
-                last_pc,
-                arms: std::mem::take(&mut current_arms),
-            });
-            current_bytes = 0;
-            partition_index += 1;
-        }
+    let mut arms_by_function = HashMap::<usize, Vec<GeneratedStateArm>>::new();
+    for arm in source_arms {
+        arms_by_function
+            .entry(arm.function_id)
+            .or_default()
+            .push(arm.clone());
     }
-    if !current_arms.is_empty() {
-        let first_pc = current_arms.first().unwrap().pc;
-        let last_pc = current_arms.last().unwrap().pc;
-        partitions.push(GeneratedStatePartition {
-            function_id: current_function.unwrap(),
-            index: partition_index,
-            first_pc,
-            last_pc,
-            arms: current_arms,
-        });
+
+    let mut partitions = Vec::new();
+    for (function_id, mut function_arms) in arms_by_function {
+        function_arms.sort_by_key(|arm| arm.pc);
+        let groups = state_arm_groups(&function_arms);
+        let mut current_arms = Vec::new();
+        let mut current_bytes = 0;
+        let mut partition_index = 0;
+
+        for group in groups {
+            let group_bytes = group.iter().map(|arm| arm.source.len()).sum::<usize>();
+            if !current_arms.is_empty()
+                && current_bytes + group_bytes > RESUMABLE_PARTITION_TARGET_BYTES
+            {
+                partitions.push(state_partition(
+                    function_id,
+                    partition_index,
+                    std::mem::take(&mut current_arms),
+                ));
+                current_bytes = 0;
+                partition_index += 1;
+            }
+            current_bytes += group_bytes;
+            current_arms.extend(group);
+
+            // Keep an individually large PC or control-flow cycle intact.
+            if current_bytes >= RESUMABLE_PARTITION_TARGET_BYTES {
+                partitions.push(state_partition(
+                    function_id,
+                    partition_index,
+                    std::mem::take(&mut current_arms),
+                ));
+                current_bytes = 0;
+                partition_index += 1;
+            }
+        }
+        if !current_arms.is_empty() {
+            partitions.push(state_partition(function_id, partition_index, current_arms));
+        }
     }
     (partitions.len() > 1).then_some(partitions)
+}
+
+fn state_partition(
+    function_id: usize,
+    index: usize,
+    mut arms: Vec<GeneratedStateArm>,
+) -> GeneratedStatePartition {
+    arms.sort_by_key(|arm| arm.pc);
+    let pcs = arms.iter().map(|arm| arm.pc).collect::<Vec<_>>();
+    GeneratedStatePartition {
+        function_id,
+        index,
+        pcs,
+        arms,
+    }
+}
+
+fn state_arm_groups(arms: &[GeneratedStateArm]) -> Vec<Vec<GeneratedStateArm>> {
+    let index_by_pc = arms
+        .iter()
+        .enumerate()
+        .map(|(index, arm)| (arm.pc, index))
+        .collect::<HashMap<_, _>>();
+    let mut edges = vec![Vec::new(); arms.len()];
+    let mut reverse_edges = vec![Vec::new(); arms.len()];
+    for (index, arm) in arms.iter().enumerate() {
+        for target_pc in emitted_pc_targets(&arm.source) {
+            if let Some(&target_index) = index_by_pc.get(&target_pc) {
+                edges[index].push(target_index);
+                reverse_edges[target_index].push(index);
+            }
+        }
+    }
+
+    fn visit(index: usize, edges: &[Vec<usize>], visited: &mut [bool], order: &mut Vec<usize>) {
+        if std::mem::replace(&mut visited[index], true) {
+            return;
+        }
+        for &next in &edges[index] {
+            visit(next, edges, visited, order);
+        }
+        order.push(index);
+    }
+
+    let mut order = Vec::with_capacity(arms.len());
+    let mut visited = vec![false; arms.len()];
+    for index in 0..arms.len() {
+        visit(index, &edges, &mut visited, &mut order);
+    }
+    let mut component_for = vec![usize::MAX; arms.len()];
+    let mut components = Vec::<Vec<usize>>::new();
+    for &root in order.iter().rev() {
+        if component_for[root] != usize::MAX {
+            continue;
+        }
+        let component_id = components.len();
+        let mut pending = vec![root];
+        let mut component = Vec::new();
+        component_for[root] = component_id;
+        while let Some(index) = pending.pop() {
+            component.push(index);
+            for &next in &reverse_edges[index] {
+                if component_for[next] == usize::MAX {
+                    component_for[next] = component_id;
+                    pending.push(next);
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    let mut grouped = vec![false; arms.len()];
+    let mut groups = Vec::new();
+    for component in components {
+        let cyclic = component.len() > 1 || edges[component[0]].contains(&component[0]);
+        if cyclic {
+            let mut group = component
+                .iter()
+                .map(|&index| {
+                    grouped[index] = true;
+                    arms[index].clone()
+                })
+                .collect::<Vec<_>>();
+            group.sort_by_key(|arm| arm.pc);
+            groups.push(group);
+        }
+    }
+    for (index, arm) in arms.iter().enumerate() {
+        if !grouped[index] {
+            groups.push(vec![arm.clone()]);
+        }
+    }
+    groups.sort_by_key(|group| group[0].pc);
+    groups
+}
+
+fn emitted_pc_targets(source: &str) -> HashSet<usize> {
+    let mut targets = HashSet::new();
+    for marker in [
+        "__aida_set_pc!(script, ",
+        "__aida_continue_at!(script, ",
+        "script.frames.last_mut().unwrap().pc = ",
+        "script.frame_mut().pc = ",
+    ] {
+        let mut rest = source;
+        while let Some(index) = rest.find(marker) {
+            rest = &rest[index + marker.len()..];
+            let end = rest.find(if marker.contains(".pc = ") { ";" } else { ");" });
+            let Some(end) = end else { break };
+            let expression = rest[..end].trim();
+            add_pc_expression(expression, source, &mut targets);
+            rest = &rest[end..];
+        }
+    }
+    targets
+}
+
+fn add_pc_expression(expression: &str, source: &str, targets: &mut HashSet<usize>) {
+    if let Ok(target) = expression.parse::<usize>() {
+        targets.insert(target);
+    } else if expression == "next_pc" {
+        if let Some(targets_expression) = source.find("let next_pc = if ").and_then(|start| {
+            source[start..]
+                .find(';')
+                .map(|end| &source[start..start + end])
+        }) {
+            add_if_pc_targets(targets_expression, targets);
+        }
+    } else {
+        add_if_pc_targets(expression, targets);
+    }
+}
+
+fn add_if_pc_targets(expression: &str, targets: &mut HashSet<usize>) {
+    let Some(if_index) = expression.find("if ") else {
+        return;
+    };
+    let expression = &expression[if_index + 3..];
+    let Some(first_open) = expression.find('{') else {
+        return;
+    };
+    let Some(first_close) = expression[first_open + 1..].find('}') else {
+        return;
+    };
+    if let Ok(target) = expression[first_open + 1..first_open + 1 + first_close]
+        .trim()
+        .parse::<usize>()
+    {
+        targets.insert(target);
+    }
+    let after_first = &expression[first_open + first_close + 2..];
+    let Some(second_open) = after_first.find('{') else {
+        return;
+    };
+    let Some(second_close) = after_first[second_open + 1..].find('}') else {
+        return;
+    };
+    if let Ok(target) = after_first[second_open + 1..second_open + 1 + second_close]
+        .trim()
+        .parse::<usize>()
+    {
+        targets.insert(target);
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+
+    #[test]
+    fn generated_state_partitions_keep_control_flow_cycles_together() {
+        let arms = [
+            GeneratedStateArm {
+                function_id: 7,
+                pc: 0,
+                source: format!(
+                    "0 => {{ __aida_continue_at!(script, 2); {} }}",
+                    " ".repeat(5_000)
+                ),
+            },
+            GeneratedStateArm {
+                function_id: 7,
+                pc: 1,
+                source: "1 => { return None; }".to_owned(),
+            },
+            GeneratedStateArm {
+                function_id: 7,
+                pc: 2,
+                source: format!(
+                    "2 => {{ let next_pc = if repeat_remaining > 0 {{ 4 }} else {{ 5 }}; script.frames.last_mut().unwrap().pc = next_pc; continue; {} }}",
+                    " ".repeat(5_000)
+                ),
+            },
+            GeneratedStateArm {
+                function_id: 7,
+                pc: 3,
+                source: "3 => { return None; }".to_owned(),
+            },
+            GeneratedStateArm {
+                function_id: 7,
+                pc: 4,
+                source: format!(
+                    "4 => {{ __aida_continue_at!(script, 0); {} }}",
+                    " ".repeat(5_000)
+                ),
+            },
+            GeneratedStateArm {
+                function_id: 7,
+                pc: 5,
+                source: format!(
+                    "5 => {{ {} }}",
+                    " ".repeat(RESUMABLE_PARTITION_TARGET_BYTES)
+                ),
+            },
+        ];
+        let partitions = partition_generated_state_arms(&arms).unwrap();
+        let cycle = partitions
+            .iter()
+            .find(|partition| partition.pcs == [0, 2, 4])
+            .expect("the cycle should stay together despite noncontiguous PCs");
+        assert_eq!(partition_pc_guard(cycle), "matches!(pc, 0 | 2 | 4)");
+        assert!(partitions.iter().all(|partition| {
+            partition
+                .pcs
+                .iter()
+                .filter(|pc| [0, 2, 4].contains(pc))
+                .count()
+                == 0
+                || partition.pcs == [0, 2, 4]
+        }));
+    }
 }
 
 fn collect_graph_state_arms(
@@ -184,6 +413,14 @@ fn collect_procedure_state_arms(
 ) -> Vec<GeneratedStateArm> {
     let mut arms = Vec::new();
     for (procedure, graph) in &plan.graphs {
+        let numeric_arguments = plan
+            .numeric_frame_arguments
+            .get(&procedure.definition_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let numeric_only_arguments = !procedure.argument_ids.is_empty()
+            && numeric_arguments.len() == procedure.argument_ids.len()
+            && numeric_arguments.iter().all(|is_numeric| *is_numeric);
         let argument_accesses = procedure
             .argument_names
             .iter()
@@ -191,7 +428,11 @@ fn collect_procedure_state_arms(
             .map(|(index, name)| {
                 (
                     name.clone(),
-                    format!("script.frames.last().unwrap().arguments[{index}]"),
+                    if numeric_arguments.get(index).copied().unwrap_or(false) {
+                        format!("__aida_numeric_arg_{index}__")
+                    } else {
+                        format!("script.argument({index})")
+                    },
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -206,7 +447,33 @@ fn collect_procedure_state_arms(
             fast_math,
             no_warp_timer,
         };
-        arms.extend(collect_graph_state_arms(context, procedure.frame_id));
+        let mut procedure_arms = collect_graph_state_arms(context, procedure.frame_id);
+        for arm in &mut procedure_arms {
+            let declarations = numeric_arguments
+                .iter()
+                .enumerate()
+                .filter(|(index, is_numeric)| {
+                    **is_numeric
+                        && arm
+                            .source
+                            .contains(&format!("__aida_numeric_arg_{index}__"))
+                })
+                .map(|(index, _)| {
+                    let access = if numeric_only_arguments {
+                        format!("script.numeric_argument({index})")
+                    } else {
+                        format!("script.argument({index}).number_or_nan()")
+                    };
+                    format!("                    let __aida_numeric_arg_{index}__ = {access};\n")
+                })
+                .collect::<String>();
+            if !declarations.is_empty()
+                && let Some(body_start) = arm.source.find(" => {\n").map(|index| index + 6)
+            {
+                arm.source.insert_str(body_start, &declarations);
+            }
+        }
+        arms.extend(procedure_arms);
     }
     arms
 }
@@ -224,7 +491,7 @@ fn emit_unpartitioned_procedure_arms(
         {
             output.push_str(&arm.source);
         }
-        line(output, 4, "_ => { script.frames.pop(); continue; },");
+        line(output, 4, "_ => { script.pop_frame(); continue; },");
         line(output, 3, "},");
     }
 }
@@ -302,14 +569,32 @@ fn partition_worker_name(function_name: &str, partition: &GeneratedStatePartitio
 }
 
 fn partition_pc_guard(partition: &GeneratedStatePartition) -> String {
-    if partition.first_pc == 0 {
-        format!("pc <= {}", partition.last_pc)
-    } else {
-        format!(
-            "pc >= {} && pc <= {}",
-            partition.first_pc, partition.last_pc
-        )
+    format!("matches!(pc, {})", partition_pc_pattern(&partition.pcs))
+}
+
+fn partition_pc_pattern(pcs: &[usize]) -> String {
+    let mut ranges = Vec::new();
+    let mut first = pcs[0];
+    let mut last = first;
+    for &pc in &pcs[1..] {
+        if pc == last + 1 {
+            last = pc;
+            continue;
+        }
+        ranges.push(if first == last {
+            first.to_string()
+        } else {
+            format!("{first}..={last}")
+        });
+        first = pc;
+        last = pc;
     }
+    ranges.push(if first == last {
+        first.to_string()
+    } else {
+        format!("{first}..={last}")
+    });
+    ranges.join(" | ")
 }
 
 fn emit_partition_worker(
@@ -319,7 +604,7 @@ fn emit_partition_worker(
     output: &mut String,
 ) {
     let worker_name = partition_worker_name(function_name, partition);
-    line(output, 0, "#[inline(never)]");
+    line(output, 0, "#[inline]");
     line(
         output,
         0,
@@ -356,7 +641,7 @@ fn emit_partition_worker(
         line(
             output,
             3,
-            &format!("_ if {pc_guard} => {{ script.frames.pop(); return None; }},"),
+            &format!("_ if {pc_guard} => {{ script.pop_frame(); return None; }},"),
         );
     } else {
         line(
@@ -388,13 +673,13 @@ fn emit_partition_pc_dispatch(
             output,
             indent,
             &format!(
-                "{}..={} => match {worker_name}(script, state, clock) {{ Some(status) => return status, None => continue, }},",
-                partition.first_pc, partition.last_pc
+                "{} => match {worker_name}(script, state, clock) {{ Some(status) => return status, None => continue, }},",
+                partition_pc_pattern(&partition.pcs)
             ),
         );
     }
     if procedure_state {
-        line(output, indent, "_ => { script.frames.pop(); continue; },");
+        line(output, indent, "_ => { script.pop_frame(); continue; },");
     } else {
         line(output, indent, "_ => return ScriptStatus::Complete,");
     }
@@ -412,6 +697,14 @@ impl ResumableProcedurePlan {
     pub(in crate::rust) fn numeric_call_procedure_ids(&self) -> &HashSet<String> {
         &self.numeric_call_procedures
     }
+
+    pub(in crate::rust) fn numeric_arguments(&self) -> &HashMap<String, Vec<bool>> {
+        &self.numeric_arguments
+    }
+
+    pub(in crate::rust) fn numeric_warp_procedure_ids(&self) -> &HashSet<String> {
+        &self.numeric_warp_procedures
+    }
 }
 
 pub(in crate::rust) fn prepare_resumable_procedures(
@@ -423,7 +716,10 @@ pub(in crate::rust) fn prepare_resumable_procedures(
     target_index: usize,
     no_warp_timer: bool,
 ) -> ResumableProcedurePlan {
-    let calls_in = |graph: &ScriptGraph, call_block_ids: &mut HashSet<String>| {
+    let calls_in = |graph: &ScriptGraph,
+                    call_block_ids: &mut HashSet<String>,
+                    caller_id: Option<&str>,
+                    call_sites: &mut Vec<ProcedureCallSite>| {
         graph
             .nodes
             .iter()
@@ -434,17 +730,24 @@ pub(in crate::rust) fn prepare_resumable_procedures(
             .filter(|(_, block)| block.opcode == "procedures_call")
             .filter_map(|(id, block)| {
                 call_block_ids.insert(id.clone());
-                procedure_for_call(block, procedures)
+                let procedure = procedure_for_call(block, procedures)?;
+                call_sites.push(ProcedureCallSite {
+                    block_id: id.clone(),
+                    caller_id: caller_id.map(str::to_owned),
+                    callee_id: procedure.definition_id.clone(),
+                });
+                Some(procedure)
             })
             .map(|procedure| procedure.definition_id.clone())
             .collect::<Vec<_>>()
     };
     let mut pending = Vec::new();
     let mut call_block_ids = HashSet::new();
+    let mut call_sites = Vec::new();
     for first in script_starts {
         let mut graph = ScriptGraph::new();
         graph.add_chain(target, *first, usize::MAX);
-        pending.extend(calls_in(&graph, &mut call_block_ids));
+        pending.extend(calls_in(&graph, &mut call_block_ids, None, &mut call_sites));
     }
 
     // Compute the union once for the target. Every script frame uses this
@@ -458,15 +761,136 @@ pub(in crate::rust) fn prepare_resumable_procedures(
         if let Some(definition) = target.blocks.get(&id) {
             let mut graph = ScriptGraph::new();
             graph.add_chain(target, definition.next.as_deref(), usize::MAX);
-            pending.extend(calls_in(&graph, &mut call_block_ids));
+            pending.extend(calls_in(
+                &graph,
+                &mut call_block_ids,
+                Some(&id),
+                &mut call_sites,
+            ));
         }
     }
 
-    let direct_warp_eligibility = if no_warp_timer {
-        direct_warp_eligibility(target, procedures)
-    } else {
-        HashMap::new()
-    };
+    let numeric_arguments =
+        infer_numeric_procedure_arguments(target, variables, procedures, &reachable, &call_sites);
+    let numeric_context_arguments =
+        infer_numeric_context_procedure_arguments(target, procedures, &reachable);
+    let numeric_frame_arguments = procedures
+        .iter()
+        .filter(|procedure| reachable.contains(&procedure.definition_id))
+        .map(|procedure| {
+            let proven = numeric_arguments
+                .get(&procedure.definition_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let contextual = numeric_context_arguments
+                .get(&procedure.definition_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let arguments = (0..procedure.argument_ids.len())
+                .map(|index| {
+                    proven.get(index).copied().unwrap_or(false)
+                        || contextual.get(index).copied().unwrap_or(false)
+                })
+                .collect();
+            (procedure.definition_id.clone(), arguments)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let direct_warp_eligibility = direct_warp_eligibility(target, procedures);
+    let bounded_warp_eligibility = direct_warp_bounded_eligibility(target, procedures);
+    let direct_warp_status_procedures = direct_warp_status_procedures(target, procedures);
+    let inline_candidates = procedures
+        .iter()
+        .filter(|procedure| {
+            procedure.warp
+                && procedure.argument_ids.is_empty()
+                && !direct_eligible(target, procedure)
+                && !(no_warp_timer
+                    && direct_warp_eligibility
+                        .get(&procedure.definition_id)
+                        .copied()
+                        .unwrap_or(false))
+                && !bounded_warp_eligibility
+                    .get(&procedure.definition_id)
+                    .copied()
+                    .unwrap_or(false)
+        })
+        .filter_map(|procedure| {
+            let definition = target.blocks.get(&procedure.definition_id)?;
+            let mut body = ScriptGraph::new();
+            body.add_chain(target, definition.next.as_deref(), usize::MAX);
+            (!body
+                .nodes
+                .iter()
+                .any(|node| matches!(node, ScriptNode::LoopBoundary(_))))
+            .then_some(procedure.definition_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let mut inline_call_counts = HashMap::<(String, String), usize>::new();
+    let mut callee_call_site_counts = HashMap::<String, usize>::new();
+    let mut procedure_call_graph = HashMap::<String, Vec<String>>::new();
+    for call_site in &call_sites {
+        *callee_call_site_counts
+            .entry(call_site.callee_id.clone())
+            .or_default() += 1;
+        if let Some(caller_id) = call_site.caller_id.as_ref() {
+            procedure_call_graph
+                .entry(caller_id.clone())
+                .or_default()
+                .push(call_site.callee_id.clone());
+        }
+    }
+    for call_site in &call_sites {
+        let Some(caller_id) = call_site.caller_id.as_deref() else {
+            continue;
+        };
+        let caller_is_warp = procedures
+            .iter()
+            .find(|procedure| procedure.definition_id == caller_id)
+            .is_some_and(|procedure| procedure.warp);
+        let recursive_edge =
+            procedure_reaches_procedure(&call_site.callee_id, caller_id, &procedure_call_graph);
+        if caller_is_warp
+            && !recursive_edge
+            && callee_call_site_counts.get(&call_site.callee_id) == Some(&1)
+            && inline_candidates.contains(&call_site.callee_id)
+        {
+            *inline_call_counts
+                .entry((caller_id.to_owned(), call_site.callee_id.clone()))
+                .or_default() += 1;
+        }
+    }
+    let mut inline_calls_by_caller = HashMap::<String, HashSet<String>>::new();
+    for call_site in &call_sites {
+        let Some(caller_id) = call_site.caller_id.as_deref() else {
+            continue;
+        };
+        if inline_call_counts.get(&(caller_id.to_owned(), call_site.callee_id.clone())) == Some(&1)
+        {
+            inline_calls_by_caller
+                .entry(caller_id.to_owned())
+                .or_default()
+                .insert(call_site.block_id.clone());
+        }
+    }
+    let fully_inlined_procedures = reachable
+        .iter()
+        .filter(|callee_id| {
+            let sites = call_sites
+                .iter()
+                .filter(|call_site| &call_site.callee_id == *callee_id)
+                .collect::<Vec<_>>();
+            !sites.is_empty()
+                && sites.iter().all(|call_site| {
+                    call_site.caller_id.as_ref().is_some_and(|caller_id| {
+                        inline_calls_by_caller
+                            .get(caller_id)
+                            .is_some_and(|blocks| blocks.contains(&call_site.block_id))
+                    })
+                })
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
     let mut graphs = Vec::new();
     let mut entries = HashMap::new();
     for procedure in procedures
@@ -477,7 +901,23 @@ pub(in crate::rust) fn prepare_resumable_procedures(
             continue;
         };
         let mut graph = ScriptGraph::new();
-        graph.add_chain(target, definition.next.as_deref(), usize::MAX);
+        let inline_calls = expanded_inline_calls(
+            &procedure.definition_id,
+            &inline_calls_by_caller,
+            &call_sites,
+        );
+        if !inline_calls.is_empty() {
+            graph.add_chain_with_inlined_calls(
+                target,
+                definition.next.as_deref(),
+                usize::MAX,
+                procedures,
+                &inline_calls,
+                &procedure.definition_id,
+            );
+        } else {
+            graph.add_chain(target, definition.next.as_deref(), usize::MAX);
+        }
         let start_pc = definition
             .next
             .as_deref()
@@ -486,21 +926,54 @@ pub(in crate::rust) fn prepare_resumable_procedures(
         let direct_path_name = direct_eligible(target, procedure)
             .then(|| direct_name(target_index, procedure.frame_id));
         let direct_path_is_none = direct_path_name.is_none();
-        let direct_warp_path = (no_warp_timer
-            && direct_path_is_none
-            && direct_warp_eligibility
+        let direct_warp_path = (direct_path_is_none
+            && ((no_warp_timer
+                && direct_warp_eligibility
+                    .get(&procedure.definition_id)
+                    .copied()
+                    .unwrap_or(false))
+                || bounded_warp_eligibility
+                    .get(&procedure.definition_id)
+                    .copied()
+                    .unwrap_or(false)))
+        .then(|| direct_warp_name(target_index, procedure.frame_id));
+        let numeric_warp_arguments = (direct_warp_path.is_some()
+            && procedure.warp
+            && bounded_warp_eligibility
                 .get(&procedure.definition_id)
                 .copied()
                 .unwrap_or(false))
-        .then(|| direct_warp_name(target_index, procedure.frame_id));
+        .then(|| numeric_arguments.get(&procedure.definition_id).cloned())
+        .flatten()
+        .filter(|arguments| arguments.len() == procedure.argument_ids.len())
+        .filter(|arguments| {
+            super::super::direct_numeric::generate_numeric_direct(
+                target,
+                procedure,
+                variables,
+                lists,
+                procedures,
+                &direct_warp_name(target_index, procedure.frame_id),
+                false,
+                Some(arguments),
+            )
+            .is_some()
+        });
+        let bounded_warp = bounded_warp_eligibility
+            .get(&procedure.definition_id)
+            .copied()
+            .unwrap_or(false);
+        let direct_warp_only = procedure.warp && bounded_warp && direct_warp_path.is_some();
         let numeric_direct = direct_path_name.is_some()
             && super::super::direct_numeric::generate_numeric_direct(
                 target,
                 procedure,
                 variables,
                 lists,
+                procedures,
                 &direct_name(target_index, procedure.frame_id),
                 true,
+                None,
             )
             .is_some();
         entries.insert(
@@ -510,11 +983,21 @@ pub(in crate::rust) fn prepare_resumable_procedures(
                 start_pc,
                 repeat_count: graph.repeat_slots.len(),
                 direct_name: direct_path_name,
+                direct_warp_returns_status: direct_warp_path.is_some()
+                    && direct_warp_status_procedures.contains(&procedure.definition_id),
                 direct_warp_name: direct_warp_path,
+                bounded_warp,
+                numeric_arguments: numeric_frame_arguments
+                    .get(&procedure.definition_id)
+                    .cloned(),
+                numeric_call_arguments: numeric_arguments.get(&procedure.definition_id).cloned(),
+                numeric_warp_arguments,
                 numeric_direct,
             },
         );
-        graphs.push((procedure.clone(), graph));
+        if !direct_warp_only && !fully_inlined_procedures.contains(&procedure.definition_id) {
+            graphs.push((procedure.clone(), graph));
+        }
     }
     let mut numeric_call_procedures = HashSet::new();
     for block_id in call_block_ids {
@@ -529,16 +1012,390 @@ pub(in crate::rust) fn prepare_resumable_procedures(
         };
         let (argument_caches, _) =
             cached_procedure_indexes(target, block, procedure, entry, variables);
-        if numeric_list_call_candidate(target, block, procedure, entry, &argument_caches) {
+        let proven_numeric_arguments =
+            numeric_arguments
+                .get(&procedure.definition_id)
+                .is_some_and(|arguments| {
+                    arguments.len() == procedure.argument_ids.len()
+                        && arguments.iter().all(|is_numeric| *is_numeric)
+                });
+        if (proven_numeric_arguments && entry.numeric_direct)
+            || numeric_list_call_candidate(target, block, procedure, entry, &argument_caches)
+        {
             numeric_call_procedures.insert(procedure.definition_id.clone());
         }
     }
+    let numeric_warp_procedures = entries
+        .iter()
+        .filter_map(|(id, entry)| entry.numeric_warp_arguments.is_some().then_some(id.clone()))
+        .collect();
     ResumableProcedurePlan {
         target_index,
         graphs,
         entries,
         reachable,
         numeric_call_procedures,
+        numeric_arguments,
+        numeric_frame_arguments,
+        numeric_warp_procedures,
+    }
+}
+
+fn procedure_reaches_procedure(
+    start: &str,
+    target: &str,
+    call_graph: &HashMap<String, Vec<String>>,
+) -> bool {
+    let mut pending = vec![start.to_owned()];
+    let mut seen = HashSet::new();
+    while let Some(procedure_id) = pending.pop() {
+        if procedure_id == target {
+            return true;
+        }
+        if !seen.insert(procedure_id.clone()) {
+            continue;
+        }
+        pending.extend(call_graph.get(&procedure_id).into_iter().flatten().cloned());
+    }
+    false
+}
+
+fn expanded_inline_calls(
+    caller_id: &str,
+    inline_calls_by_caller: &HashMap<String, HashSet<String>>,
+    call_sites: &[ProcedureCallSite],
+) -> HashSet<String> {
+    let mut pending = vec![caller_id.to_owned()];
+    let mut expanded_callers = HashSet::new();
+    let mut inline_calls = HashSet::new();
+    while let Some(current_caller) = pending.pop() {
+        if !expanded_callers.insert(current_caller.clone()) {
+            continue;
+        }
+        let Some(selected_calls) = inline_calls_by_caller.get(&current_caller) else {
+            continue;
+        };
+        for call_site in call_sites.iter().filter(|site| {
+            site.caller_id.as_deref() == Some(current_caller.as_str())
+                && selected_calls.contains(&site.block_id)
+        }) {
+            inline_calls.insert(call_site.block_id.clone());
+            pending.push(call_site.callee_id.clone());
+        }
+    }
+    inline_calls
+}
+
+fn infer_numeric_procedure_arguments(
+    target: &ScratchTarget,
+    variables: &HashMap<String, VariableInfo>,
+    procedures: &[ProcedureSignature],
+    reachable: &HashSet<String>,
+    call_sites: &[ProcedureCallSite],
+) -> HashMap<String, Vec<bool>> {
+    let mut numeric = procedures
+        .iter()
+        .filter(|procedure| reachable.contains(&procedure.definition_id))
+        .map(|procedure| {
+            let arity_matches = procedure.argument_names.len() == procedure.argument_ids.len();
+            (
+                procedure.definition_id.clone(),
+                vec![arity_matches; procedure.argument_ids.len()],
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let signatures = procedures
+        .iter()
+        .map(|procedure| (procedure.definition_id.as_str(), procedure))
+        .collect::<HashMap<_, _>>();
+
+    loop {
+        let previous = numeric.clone();
+        for call_site in call_sites {
+            let (Some(callee), Some(block)) = (
+                signatures.get(call_site.callee_id.as_str()).copied(),
+                target.blocks.get(&call_site.block_id),
+            ) else {
+                continue;
+            };
+            let caller = call_site
+                .caller_id
+                .as_deref()
+                .and_then(|id| signatures.get(id).copied());
+            let caller_arguments = call_site
+                .caller_id
+                .as_deref()
+                .and_then(|id| previous.get(id));
+            let Some(callee_arguments) = numeric.get_mut(&callee.definition_id) else {
+                continue;
+            };
+            for (index, argument_id) in callee.argument_ids.iter().enumerate() {
+                let proven_number = input_is_proven_numeric_argument(
+                    target,
+                    block.inputs.get(argument_id),
+                    variables,
+                    caller,
+                    caller_arguments.map(Vec::as_slice),
+                );
+                callee_arguments[index] &= proven_number;
+            }
+        }
+        if numeric == previous {
+            return numeric;
+        }
+    }
+}
+
+fn infer_numeric_context_procedure_arguments(
+    target: &ScratchTarget,
+    procedures: &[ProcedureSignature],
+    reachable: &HashSet<String>,
+) -> HashMap<String, Vec<bool>> {
+    let mut numeric = procedures
+        .iter()
+        .filter(|procedure| reachable.contains(&procedure.definition_id))
+        .map(|procedure| {
+            (
+                procedure.definition_id.clone(),
+                vec![true; procedure.argument_ids.len()],
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let procedure_blocks = procedures
+        .iter()
+        .filter(|procedure| reachable.contains(&procedure.definition_id))
+        .map(|procedure| {
+            let mut graph = ScriptGraph::new();
+            let first = target
+                .blocks
+                .get(&procedure.definition_id)
+                .and_then(|definition| definition.next.as_deref());
+            graph.add_chain(target, first, usize::MAX);
+            let blocks = graph
+                .nodes
+                .iter()
+                .filter_map(|node| match node {
+                    ScriptNode::Block(id) => Some(id.clone()),
+                    ScriptNode::LoopBoundary(_) => None,
+                })
+                .collect::<HashSet<_>>();
+            (procedure.definition_id.clone(), blocks)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut used_arguments = procedures
+        .iter()
+        .filter(|procedure| reachable.contains(&procedure.definition_id))
+        .map(|procedure| {
+            (
+                procedure.definition_id.clone(),
+                vec![false; procedure.argument_ids.len()],
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    loop {
+        let previous = numeric.clone();
+        for procedure in procedures
+            .iter()
+            .filter(|procedure| reachable.contains(&procedure.definition_id))
+        {
+            let Some(block_ids) = procedure_blocks.get(&procedure.definition_id) else {
+                continue;
+            };
+            let Some(arguments) = numeric.get_mut(&procedure.definition_id) else {
+                continue;
+            };
+            for (id, block) in &target.blocks {
+                if !matches!(
+                    block.opcode.as_str(),
+                    "argument_reporter_string_number" | "argument_reporter_boolean"
+                ) || !argument_reporter_belongs_to_procedure(target, block, block_ids)
+                {
+                    continue;
+                }
+                let is_number_reporter = block.opcode == "argument_reporter_string_number";
+                let Some(index) = field_value(block, "VALUE")
+                    .and_then(Value::as_str)
+                    .and_then(|name| {
+                        procedure
+                            .argument_names
+                            .iter()
+                            .position(|candidate| candidate == name)
+                    })
+                else {
+                    continue;
+                };
+                if let Some(used) = used_arguments
+                    .get_mut(&procedure.definition_id)
+                    .and_then(|arguments| arguments.get_mut(index))
+                {
+                    *used = true;
+                }
+                let numeric_use = is_number_reporter
+                    && block
+                        .parent
+                        .as_deref()
+                        .and_then(|parent_id| target.blocks.get(parent_id))
+                        .is_some_and(|parent| {
+                            argument_input_is_numeric_context(parent, id, procedures, &previous)
+                        });
+                if !numeric_use {
+                    arguments[index] = false;
+                }
+            }
+        }
+        if numeric == previous {
+            for (procedure_id, arguments) in &mut numeric {
+                let Some(used) = used_arguments.get(procedure_id) else {
+                    continue;
+                };
+                for (is_numeric, is_used) in arguments.iter_mut().zip(used) {
+                    *is_numeric &= *is_used;
+                }
+            }
+            return numeric;
+        }
+    }
+}
+
+fn argument_reporter_belongs_to_procedure(
+    target: &ScratchTarget,
+    reporter: &ScratchBlock,
+    procedure_blocks: &HashSet<String>,
+) -> bool {
+    let mut parent = reporter.parent.as_deref();
+    let mut seen = HashSet::new();
+    while let Some(parent_id) = parent {
+        if !seen.insert(parent_id) {
+            return false;
+        }
+        if procedure_blocks.contains(parent_id) {
+            return true;
+        }
+        parent = target
+            .blocks
+            .get(parent_id)
+            .and_then(|block| block.parent.as_deref());
+    }
+    false
+}
+
+fn argument_input_is_numeric_context(
+    parent: &ScratchBlock,
+    child_id: &str,
+    procedures: &[ProcedureSignature],
+    numeric_arguments: &HashMap<String, Vec<bool>>,
+) -> bool {
+    let input_name = parent.inputs.iter().find_map(|(name, input)| {
+        matches!(parse_input(input), Some(InputValue::BlockReference(id)) if id == child_id)
+            .then_some(name.as_str())
+    });
+    let Some(input_name) = input_name else {
+        return false;
+    };
+    match parent.opcode.as_str() {
+        "operator_add" | "operator_subtract" | "operator_multiply" | "operator_divide"
+        | "operator_mod" | "operator_round" | "operator_random" | "operator_mathop" => true,
+        "data_changevariableby" => input_name == "VALUE",
+        "control_repeat" => input_name == "TIMES",
+        "data_itemoflist"
+        | "data_deleteoflist"
+        | "data_replaceitemoflist"
+        | "data_insertatlist" => input_name == "INDEX",
+        "motion_movesteps"
+        | "motion_turnright"
+        | "motion_turnleft"
+        | "motion_goto"
+        | "motion_glideto"
+        | "motion_changexby"
+        | "motion_setx"
+        | "motion_changeyby"
+        | "motion_sety"
+        | "motion_pointindirection"
+        | "motion_pointtowards"
+        | "motion_gotoxy"
+        | "motion_glidesecstoxy"
+        | "motion_changexyby" => !matches!(input_name, "TO" | "TOWARDS"),
+        "procedures_call" => {
+            let Some(callee) = procedure_for_call(parent, procedures) else {
+                return false;
+            };
+            let argument_ids = parent
+                .mutation
+                .get("argumentids")
+                .and_then(Value::as_str)
+                .and_then(|encoded| serde_json::from_str::<Vec<String>>(encoded).ok())
+                .unwrap_or_default();
+            let Some(index) = argument_ids.iter().position(|id| id == input_name) else {
+                return false;
+            };
+            numeric_arguments
+                .get(&callee.definition_id)
+                .and_then(|arguments| arguments.get(index))
+                .copied()
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn input_is_proven_numeric_argument(
+    target: &ScratchTarget,
+    input: Option<&serde_json::Value>,
+    variables: &HashMap<String, VariableInfo>,
+    caller: Option<&ProcedureSignature>,
+    caller_arguments: Option<&[bool]>,
+) -> bool {
+    match input.and_then(parse_input) {
+        Some(InputValue::Number(_)) => true,
+        Some(InputValue::VariableReference(reference)) => {
+            super::super::project::variable_for_target(target, reference.id, variables)
+                .is_some_and(|variable| variable.numeric && !variable.monitor_visible)
+        }
+        Some(InputValue::BlockReference(id)) => {
+            let Some(block) = target.blocks.get(id) else {
+                return false;
+            };
+            match block.opcode.as_str() {
+                "argument_reporter_string_number" | "argument_reporter_boolean" => {
+                    let Some(index) = field_value(block, "VALUE")
+                        .and_then(Value::as_str)
+                        .and_then(|name| {
+                            caller?
+                                .argument_names
+                                .iter()
+                                .position(|candidate| candidate == name)
+                        })
+                    else {
+                        return false;
+                    };
+                    caller_arguments
+                        .and_then(|arguments| arguments.get(index))
+                        .copied()
+                        .unwrap_or(false)
+                }
+                "data_variable" => variable_field(block, "VARIABLE", variables)
+                    .is_some_and(|variable| variable.numeric && !variable.monitor_visible),
+                "operator_add"
+                | "operator_subtract"
+                | "operator_multiply"
+                | "operator_divide"
+                | "operator_mod"
+                | "operator_round"
+                | "operator_random"
+                | "operator_mathop"
+                | "data_lengthoflist"
+                | "data_itemnumoflist"
+                | "math_number"
+                | "math_integer"
+                | "math_whole_number"
+                | "math_positive_number"
+                | "math_angle" => true,
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -876,7 +1733,7 @@ fn generate_resumable_block(context: ScriptBlockChainContext<'_>, id: &str, outp
     let indent = 4;
     line(output, indent, &format!("{pc} => {{"));
     let Some(block) = target.blocks.get(id) else {
-        line(output, indent + 1, "script.frames.pop(); continue;");
+        line(output, indent + 1, "script.pop_frame(); continue;");
         line(output, indent, "},");
         return;
     };
@@ -885,6 +1742,22 @@ fn generate_resumable_block(context: ScriptBlockChainContext<'_>, id: &str, outp
         .as_ref()
         .and_then(|next| graph.block_pcs.get(next).copied())
         .unwrap_or(graph.fallthrough_pcs[id]);
+    if block.opcode == "control_stop"
+        && field_value(block, "STOP_OPTION").and_then(Value::as_str) == Some("this script")
+        && let Some(return_pc) = graph.inlined_return_pcs.get(id).copied()
+    {
+        line(
+            output,
+            indent + 1,
+            &format!(
+                "script.frames.last_mut().unwrap().pc = {};",
+                pc_literal(return_pc)
+            ),
+        );
+        line(output, indent + 1, "continue;");
+        line(output, indent, "},");
+        return;
+    }
     match block.opcode.as_str() {
         "control_if" | "control_if_else" => {
             let condition = boolean_input(
@@ -1288,6 +2161,31 @@ fn generate_resumable_block(context: ScriptBlockChainContext<'_>, id: &str, outp
             output,
             indent + 1,
         ),
+        "procedures_call" if graph.inlined_calls.contains_key(id) => {
+            let entry_pc = graph.inlined_calls[id];
+            if !no_warp_timer {
+                line(output, indent + 1, "if script.warp_budget.expired(clock) {");
+                line(
+                    output,
+                    indent + 2,
+                    &format!(
+                        "script.frames.last_mut().unwrap().pc = {};",
+                        pc_literal(entry_pc)
+                    ),
+                );
+                line(output, indent + 2, "return ScriptStatus::Yield;");
+                line(output, indent + 1, "}");
+            }
+            line(
+                output,
+                indent + 1,
+                &format!(
+                    "script.frames.last_mut().unwrap().pc = {};",
+                    pc_literal(entry_pc)
+                ),
+            );
+            line(output, indent + 1, "continue;");
+        }
         "procedures_call" => generate_resumable_procedure_call(
             ProcedureCallContext {
                 target,
@@ -1303,6 +2201,7 @@ fn generate_resumable_block(context: ScriptBlockChainContext<'_>, id: &str, outp
             ProcedureCallOutput {
                 output,
                 indent: indent + 1,
+                call_pc: pc,
                 emit_continue: true,
                 reusable_indexes: None,
                 reusable_items: None,
@@ -1560,7 +2459,7 @@ fn generate_resumable_block_chain(
     if let (Some((loop_id, enclosing)), Some(body_plan)) = (enclosing_loop, structured_loop_blocks)
     {
         if !body_plan.has_procedure_calls {
-            emitted_blocks.extend(body_plan.blocks);
+            emitted_blocks.extend(body_plan.blocks.iter().cloned());
         }
         line(output, 4, &format!("{} => {{", graph.block_pcs[id]));
         let repeat = enclosing.opcode == "control_repeat";
@@ -1603,18 +2502,12 @@ fn generate_resumable_block_chain(
                 .chain(dynamic.iter().map(|variable| variable.slot))
                 .collect::<HashSet<_>>();
             if !defer_slots.is_empty() {
-                let mut slots = defer_slots.into_iter().collect::<Vec<_>>();
-                slots.sort_unstable();
                 line(
                     output,
                     5,
                     &format!(
-                        "let scratch_defer_writes = state.can_defer_variable_writes(&[{}]);",
-                        slots
-                            .iter()
-                            .map(usize::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        "let scratch_defer_writes = state.can_defer_variable_write_mask({});",
+                        variable_write_mask(defer_slots.iter().copied())
                     ),
                 );
             }
@@ -1678,10 +2571,11 @@ fn generate_resumable_block_chain(
                     "let scratch_warp_mode = script.frames.last().unwrap().warp_mode;",
                 );
             }
+            let loop_indent = block_indent;
             if repeat {
-                line(output, block_indent, "loop {");
+                line(output, loop_indent, "loop {");
             }
-            let body_indent = block_indent + usize::from(repeat);
+            let body_indent = loop_indent + usize::from(repeat);
             let loop_context = StructuredLoopContext {
                 target,
                 graph,
@@ -1797,7 +2691,7 @@ fn generate_resumable_block_chain(
                 line(output, body_indent + 1, "return ScriptStatus::Yield;");
                 line(output, body_indent, "}");
                 line(output, body_indent, "if repeat_remaining == 0 { break; }");
-                line(output, block_indent, "}");
+                line(output, loop_indent, "}");
                 if has_locals {
                     line(
                         output,
@@ -1872,18 +2766,12 @@ fn generate_resumable_block_chain(
         }
         line(output, 4, &format!("{} => {{", graph.block_pcs[id]));
         if !deferred.is_empty() {
-            let mut slots = deferred.iter().copied().collect::<Vec<_>>();
-            slots.sort_unstable();
             line(
                 output,
                 5,
                 &format!(
-                    "let scratch_defer_writes = state.can_defer_variable_writes(&[{}]);",
-                    slots
-                        .iter()
-                        .map(usize::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "let scratch_defer_writes = state.can_defer_variable_write_mask({});",
+                    variable_write_mask(deferred.iter().copied())
                 ),
             );
         }
@@ -2090,18 +2978,12 @@ fn generate_resumable_block_chain(
         let continuation = graph.fallthrough_pcs[last];
         line(output, 4, &format!("{} => {{", graph.block_pcs[id]));
         if !deferred.is_empty() {
-            let mut slots = deferred.iter().copied().collect::<Vec<_>>();
-            slots.sort_unstable();
             line(
                 output,
                 5,
                 &format!(
-                    "let scratch_defer_writes = state.can_defer_variable_writes(&[{}]);",
-                    slots
-                        .iter()
-                        .map(usize::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "let scratch_defer_writes = state.can_defer_variable_write_mask({});",
+                    variable_write_mask(deferred.iter().copied())
                 ),
             );
         }
@@ -2209,18 +3091,12 @@ fn generate_resumable_block_chain(
         }
         line(output, 4, &format!("{} => {{", graph.block_pcs[id]));
         if !deferred.is_empty() {
-            let mut deferred_slots = deferred.iter().copied().collect::<Vec<_>>();
-            deferred_slots.sort_unstable();
             line(
                 output,
                 5,
                 &format!(
-                    "let scratch_defer_writes = state.can_defer_variable_writes(&[{}]);",
-                    deferred_slots
-                        .iter()
-                        .map(usize::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "let scratch_defer_writes = state.can_defer_variable_write_mask({});",
+                    variable_write_mask(deferred.iter().copied())
                 ),
             );
         }

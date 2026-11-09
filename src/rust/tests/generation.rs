@@ -76,7 +76,7 @@ fn engine_resumable_procedures_are_split_into_bounded_native_workers() {
         "worker source exceeded the single-arm allowance: {} bytes",
         worker_sizes.iter().copied().max().unwrap_or_default()
     );
-    assert!(output.contains("#[inline(never)]\n#[allow(dead_code"));
+    assert!(output.contains("#[inline]\n#[allow(dead_code"));
 }
 
 #[test]

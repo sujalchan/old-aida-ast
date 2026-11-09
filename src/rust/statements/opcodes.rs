@@ -241,7 +241,7 @@ pub(super) fn generate_resumable_statement(
                 line(
                     output,
                     indent,
-                    "if script.frames.len() > 1 { script.frames.pop(); continue; } return ScriptStatus::Complete;",
+                    "if script.frames.len() > 1 { script.pop_frame(); continue; } return ScriptStatus::Complete;",
                 );
             }
             Some("other scripts in sprite") | Some("other scripts in stage") => {
@@ -1147,7 +1147,7 @@ pub(super) fn generate_glide_statement(
     line(output, indent, "}");
 }
 
-pub(super) fn procedure_for_call<'a>(
+pub(in crate::rust) fn procedure_for_call<'a>(
     block: &ScratchBlock,
     procedures: &'a [ProcedureSignature],
 ) -> Option<&'a ProcedureSignature> {
@@ -1228,7 +1228,13 @@ pub(super) fn owned_input(
     arguments: &HashMap<String, String>,
 ) -> String {
     if let Some(source) = variable_input(target, input, variables, lists, arguments) {
-        format!("({source}).clone()")
+        if source.starts_with("script.numeric_argument(")
+            || source.starts_with("__aida_numeric_arg_")
+        {
+            format!("ScratchValue::Number({source})")
+        } else {
+            format!("({source}).clone()")
+        }
     } else {
         let value = expression(
             target,

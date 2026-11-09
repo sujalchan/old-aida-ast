@@ -53,7 +53,7 @@ fn stop_loop_fixture_lowers_this_script_inside_a_custom_block_and_stop_all() {
     let project = parse_project(&json).unwrap();
     let output = generate(&project);
 
-    assert!(output.contains("if script.frames.len() > 1 { script.frames.pop(); continue; }"));
+    assert!(output.contains("if script.frames.len() > 1 { script.pop_frame(); continue; }"));
     assert!(output.contains("return ScriptStatus::StopAll;"));
     assert!(!output.contains("unsupported statement: control_stop"));
 }
@@ -174,7 +174,7 @@ fn loop_body_keeps_states_needed_after_a_warp_call_yields() {
     let output = generate(&project);
 
     assert!(output.contains("fn direct_procedure_"));
-    assert!(output.contains("script.frames.push(ProcedureFrame::new("));
+    assert!(output.contains("script.push_frame("));
     assert!(output.contains("repeat_counts["));
     assert!(count_resumable_pc_arms(&output) >= 4);
 }
@@ -284,7 +284,7 @@ fn lowers_nested_repeat_until_and_forever_with_resumable_loop_state() {
         .unwrap();
 
     let output = generate(&project);
-    assert!(output.contains("vec![0; 2]"));
+    assert!(output.contains("smallvec::smallvec![0; 2]"));
     assert!(output.contains("script.frame_mut().repeat_counts[0] = repeat_count;"));
     assert!(output.contains("script.frame_mut().repeat_counts[1] = repeat_count;"));
     assert_eq!(
@@ -314,7 +314,7 @@ fn structured_loop_merges_nested_numeric_branches_and_commits_before_yield() {
             }]
         }).to_string()).unwrap();
     let output = generate(&project);
-    assert!(output.contains("state.can_defer_variable_writes(&[1, 2])"));
+    assert!(output.contains("state.can_defer_variable_write_mask(&[0x0000000000000006_u64])"));
     assert!(output.contains("scratch_typed_2 = 1.0_f64;"));
     assert!(output.contains("scratch_typed_2 = 0.0_f64;"));
     assert!(output.contains("scratch_dirty_1 = true;"));
@@ -332,8 +332,8 @@ fn structured_loop_merges_nested_numeric_branches_and_commits_before_yield() {
     );
     assert!(before_yield.contains("ScratchValue::Text(scratch_string(scratch_typed_2))"));
     assert!(
-        output.contains("state.change_local_number(1, scratch_change);"),
-        "dynamic fallback must remain"
+        output.contains("state.set_local_number(1, scratch_typed_1);"),
+        "proven numeric writes should commit the numeric local directly"
     );
     assert_eq!(count_resumable_pc_arms(&output), 2);
 }
@@ -367,7 +367,7 @@ fn structured_loop_uses_numeric_codegen_when_type_is_proven_even_if_nan_is_possi
     assert!(output.contains("number_or_nan()"));
     assert!(!output.contains("canonical_number()"));
     assert!(!output.contains("state.change_local_number("));
-    assert!(output.contains("let scratch_defer_writes = state.can_defer_variable_writes("));
+    assert!(output.contains("let scratch_defer_writes = state.can_defer_variable_write_mask(&["));
     assert!(output.contains("if scratch_defer_writes { scratch_dirty_"));
     assert!(output.contains("else { state.set_local_number("));
 }
@@ -404,7 +404,7 @@ fn structured_loop_keeps_a_dynamic_fallback_for_variables_written_as_text_elsewh
         .find(|line| line.contains("canonical_number()") && line.contains("if let"))
         .unwrap();
     assert!(!guard.contains("can_defer_variable_writes"));
-    assert!(output.contains("let scratch_defer_writes = state.can_defer_variable_writes("));
+    assert!(output.contains("let scratch_defer_writes = state.can_defer_variable_write_mask(&["));
 }
 
 fn count_resumable_pc_arms(source: &str) -> usize {

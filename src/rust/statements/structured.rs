@@ -241,7 +241,9 @@ pub(super) fn numeric_entry_guards<'a>(
     // canonical_number is needed only when the runtime type can vary.
     numeric
         .iter()
-        .filter(|variable| needed.contains(&variable.slot) && !variable.numeric)
+        .filter(|variable| {
+            needed.contains(&variable.slot) && !variable.numeric && !variable.canonical_numeric
+        })
         .collect()
 }
 
@@ -260,6 +262,19 @@ pub(super) fn emit_numeric_local_initializers(
             indent,
             &format!(
                 "let mut scratch_typed_{0} = {1}.number_or_nan();",
+                variable.slot,
+                variable.read_expression()
+            ),
+        );
+    }
+    for variable in numeric.iter().filter(|variable| {
+        needed.contains(&variable.slot) && !variable.numeric && variable.canonical_numeric
+    }) {
+        line(
+            output,
+            indent,
+            &format!(
+                "let mut scratch_typed_{0} = scratch_to_number({1});",
                 variable.slot,
                 variable.read_expression()
             ),
@@ -328,6 +343,52 @@ pub(super) fn emit_numeric_write_commit(
             indent,
             &format!("state.{setter}({slot}, scratch_typed_{slot});"),
         );
+    }
+}
+
+#[cfg(test)]
+mod numeric_entry_guard_tests {
+    use super::*;
+
+    fn variable(canonical_numeric: bool) -> VariableInfo {
+        VariableInfo {
+            id: "value".to_owned(),
+            slot: 4,
+            name: "value".to_owned(),
+            target: "Sprite1".to_owned(),
+            is_stage: false,
+            target_index: 0,
+            target_variable_order: 0,
+            numeric: false,
+            canonical_numeric,
+            non_nan: false,
+            monitor_visible: false,
+            index_read_override: None,
+        }
+    }
+
+    #[test]
+    fn canonical_numeric_text_uses_unconditional_coercion_without_a_fallback_guard() {
+        let variable = variable(true);
+        let needed = HashSet::from([variable.slot]);
+        let guards = numeric_entry_guards(std::slice::from_ref(&variable), &needed);
+        assert!(guards.is_empty());
+
+        let mut output = String::new();
+        emit_numeric_local_initializers(&mut output, 0, &[variable], &needed);
+        assert!(output.contains("let mut scratch_typed_4 = scratch_to_number(state.get(4));"));
+    }
+
+    #[test]
+    fn unproven_text_keeps_its_numeric_fallback_guard() {
+        let variable = variable(false);
+        let needed = HashSet::from([variable.slot]);
+        let guards = numeric_entry_guards(std::slice::from_ref(&variable), &needed);
+        assert_eq!(guards.len(), 1);
+
+        let mut output = String::new();
+        emit_numeric_entry_guard(&mut output, 0, &guards);
+        assert!(output.contains("state.get(4).canonical_number()"));
     }
 }
 
@@ -1105,24 +1166,47 @@ pub(super) fn emit_partial_structured_chain<'a>(
                 let value = canonical_constant(block.inputs.get("VALUE")).unwrap();
                 emit_typed_text_numeric_set(output, indent, variable, &value, deferred);
             } else if block.opcode == "data_replaceitemoflist" && !numeric.is_empty() {
-                emit_deferred_numeric_flush(output, indent, original_variables, deferred, textual);
                 let next = block
                     .next
                     .as_ref()
                     .and_then(|id| graph.block_pcs.get(id).copied())
                     .unwrap_or(graph.fallthrough_pcs[current]);
-                generate_resumable_statement(
-                    StatementContext {
-                        target,
-                        variables: original_variables,
-                        lists,
-                        arguments,
-                    },
-                    block,
-                    next,
-                    output,
-                    indent,
-                );
+                if let Some((destination, destination_index, source, source_index)) =
+                    numeric_local_list_copy(target, block, variables, lists, numeric, textual)
+                {
+                    emit_numeric_local_list_copy(
+                        output,
+                        indent,
+                        destination,
+                        destination_index,
+                        source,
+                        source_index,
+                    );
+                } else if let Some((list, index, item)) = numeric_local_list_replacement(
+                    target, block, variables, lists, numeric, textual,
+                ) {
+                    emit_numeric_local_list_replacement(output, indent, list, &index, &item);
+                } else {
+                    emit_deferred_numeric_flush(
+                        output,
+                        indent,
+                        original_variables,
+                        deferred,
+                        textual,
+                    );
+                    generate_resumable_statement(
+                        StatementContext {
+                            target,
+                            variables: original_variables,
+                            lists,
+                            arguments,
+                        },
+                        block,
+                        next,
+                        output,
+                        indent,
+                    );
+                }
             } else {
                 let next = block
                     .next
@@ -1211,6 +1295,7 @@ pub(super) fn emit_partial_structured_chain<'a>(
                 ProcedureCallOutput {
                     output,
                     indent,
+                    call_pc: graph.block_pcs[current],
                     emit_continue: false,
                     reusable_indexes: None,
                     reusable_items: None,
@@ -1235,6 +1320,158 @@ pub(super) fn emit_partial_structured_chain<'a>(
         id = block.next.as_deref();
     }
     requires_escape_label
+}
+
+pub(super) fn numeric_local_list_replacement(
+    target: &ScratchTarget,
+    block: &ScratchBlock,
+    variables: &HashMap<String, VariableInfo>,
+    lists: &HashMap<String, ListInfo>,
+    numeric: &HashSet<usize>,
+    textual: &HashSet<usize>,
+) -> Option<(ListInfo, String, String)> {
+    let list = list_field(block, "LIST", lists)?;
+    let locals = numeric
+        .difference(textual)
+        .map(|slot| (*slot, format!("scratch_typed_{slot}")))
+        .collect::<HashMap<_, _>>();
+    let local_number = |name: &str| {
+        local_expression(
+            target,
+            block.inputs.get(name),
+            variables,
+            &locals,
+            false,
+            &mut HashSet::new(),
+        )
+        .filter(|value| value.kind == LocalValueKind::Number)
+        .map(|value| value.code)
+    };
+    Some((list, local_number("INDEX")?, local_number("ITEM")?))
+}
+
+fn numeric_local_list_copy(
+    target: &ScratchTarget,
+    block: &ScratchBlock,
+    variables: &HashMap<String, VariableInfo>,
+    lists: &HashMap<String, ListInfo>,
+    numeric: &HashSet<usize>,
+    textual: &HashSet<usize>,
+) -> Option<(ListInfo, String, ListInfo, String)> {
+    let destination = list_field(block, "LIST", lists)?;
+    let InputValue::BlockReference(item_reporter_id) =
+        block.inputs.get("ITEM").and_then(parse_input)?
+    else {
+        return None;
+    };
+    let item_reporter = target.blocks.get(item_reporter_id)?;
+    if item_reporter.opcode != "data_itemoflist" {
+        return None;
+    }
+    let source = list_field(item_reporter, "LIST", lists)?;
+    let locals = numeric
+        .difference(textual)
+        .map(|slot| (*slot, format!("scratch_typed_{slot}")))
+        .collect::<HashMap<_, _>>();
+    let local_number = |input: Option<&Value>| {
+        local_expression(
+            target,
+            input,
+            variables,
+            &locals,
+            false,
+            &mut HashSet::new(),
+        )
+        .filter(|value| value.kind == LocalValueKind::Number)
+        .map(|value| value.code)
+    };
+    Some((
+        destination,
+        local_number(block.inputs.get("INDEX"))?,
+        source,
+        local_number(item_reporter.inputs.get("INDEX"))?,
+    ))
+}
+
+fn emit_numeric_local_list_copy(
+    output: &mut String,
+    indent: usize,
+    destination: ListInfo,
+    destination_index: String,
+    source: ListInfo,
+    source_index: String,
+) {
+    // Evaluate the source index before the destination index, as Scratch does.
+    line(
+        output,
+        indent,
+        &format!("let scratch_source_index = {source_index};"),
+    );
+    line(
+        output,
+        indent,
+        &format!("let scratch_destination_index = {destination_index};"),
+    );
+    let copy = format!(
+        "state.copy_list_item_numeric::<{}, {}, {}, {}, {}>(scratch_source_index, scratch_destination_index)",
+        source.slot,
+        destination.slot,
+        source.is_stage,
+        destination.is_stage,
+        destination.monitor_possible,
+    );
+    if destination.monitor_possible {
+        line(
+            output,
+            indent,
+            &format!("let scratch_list_changed = {copy};"),
+        );
+        line(
+            output,
+            indent,
+            &format!(
+                "state.list_changed_result({}, scratch_list_changed);",
+                destination.slot
+            ),
+        );
+    } else {
+        line(output, indent, &format!("{copy};"));
+    }
+}
+
+fn emit_numeric_local_list_replacement(
+    output: &mut String,
+    indent: usize,
+    list: ListInfo,
+    index: &str,
+    item: &str,
+) {
+    let list_mut = if list.is_stage {
+        format!("state.stage_list_mut({})", list.slot)
+    } else {
+        format!("state.list_mut({})", list.slot)
+    };
+    if list.monitor_possible {
+        line(
+            output,
+            indent,
+            &format!("let scratch_list_changed = {list_mut}.replace_number({index}, {item});"),
+        );
+        line(
+            output,
+            indent,
+            &format!(
+                "state.list_changed_result({}, scratch_list_changed);",
+                list.slot
+            ),
+        );
+    } else {
+        line(
+            output,
+            indent,
+            &format!("{list_mut}.replace_number_unobserved({index}, {item});"),
+        );
+    }
 }
 
 pub(super) struct StructuredLoopContext<'a> {
@@ -1353,6 +1590,7 @@ pub(super) fn emit_structured_loop_chain<'a>(
                     ProcedureCallOutput {
                         output,
                         indent,
+                        call_pc: graph.block_pcs[id],
                         emit_continue: false,
                         reusable_indexes: Some(cached_indexes),
                         reusable_items: Some(cached_items),
@@ -1516,28 +1754,56 @@ pub(super) fn emit_structured_loop_chain<'a>(
                 } else if block.opcode == "data_replaceitemoflist"
                     && (!numeric_locals.is_empty() || !dynamic.is_empty())
                 {
-                    // This operation consumes authoritative ScratchValue inputs.
-                    // Commit pending locals and use the existing lowering unchanged.
-                    emit_deferred_numeric_flush(
-                        output,
-                        indent,
-                        original_variables,
-                        deferred,
-                        textual,
-                    );
-                    emit_deferred_dynamic_commits(output, indent, dynamic, true);
-                    generate_resumable_statement(
-                        StatementContext {
+                    if let Some((destination, destination_index, source, source_index)) =
+                        numeric_local_list_copy(
                             target,
-                            variables: original_variables,
+                            block,
+                            variables,
                             lists,
-                            arguments,
-                        },
+                            numeric_locals,
+                            textual,
+                        )
+                    {
+                        emit_numeric_local_list_copy(
+                            output,
+                            indent,
+                            destination,
+                            destination_index,
+                            source,
+                            source_index,
+                        );
+                    } else if let Some((list, index, item)) = numeric_local_list_replacement(
+                        target,
                         block,
-                        next_pc,
-                        output,
-                        indent,
-                    );
+                        variables,
+                        lists,
+                        numeric_locals,
+                        textual,
+                    ) {
+                        emit_numeric_local_list_replacement(output, indent, list, &index, &item);
+                    } else {
+                        // Keep the dynamic lowering when either input can be a Scratch string.
+                        emit_deferred_numeric_flush(
+                            output,
+                            indent,
+                            original_variables,
+                            deferred,
+                            textual,
+                        );
+                        emit_deferred_dynamic_commits(output, indent, dynamic, true);
+                        generate_resumable_statement(
+                            StatementContext {
+                                target,
+                                variables: original_variables,
+                                lists,
+                                arguments,
+                            },
+                            block,
+                            next_pc,
+                            output,
+                            indent,
+                        );
+                    }
                 } else {
                     generate_resumable_statement(
                         StatementContext {

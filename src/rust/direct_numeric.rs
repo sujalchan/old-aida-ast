@@ -1,14 +1,14 @@
 //! Guarded numeric locals for bounded, non-suspending direct procedures.
 //!
-//! The dynamic procedure remains authoritative for noncanonical inputs. All
-//! writes are committed immediately; only reads within the call are cached.
+//! The dynamic procedure remains authoritative for noncanonical inputs. Writes
+//! with no observers may be committed at the end; reads within the call are cached.
 
 use super::{
     expressions::expression,
     literals::{field_value, line, number_literal},
     project::{ListInfo, VariableInfo},
     scripts::ProcedureSignature,
-    statements::variable_field,
+    statements::{procedure_for_call, variable_field, variable_write_mask},
 };
 use crate::parser::{InputValue, ScratchBlock, ScratchTarget, parse_input};
 use serde_json::Value;
@@ -27,8 +27,9 @@ struct NumericExpr {
 struct Compiler<'a> {
     target: &'a ScratchTarget,
     variables: &'a HashMap<String, VariableInfo>,
-    argument_values: &'a HashMap<String, String>,
+    argument_values: HashMap<String, String>,
     lists: &'a HashMap<String, ListInfo>,
+    procedures: &'a [ProcedureSignature],
     arguments: HashMap<String, usize>,
     all: BTreeMap<usize, VariableInfo>,
     needed: BTreeMap<usize, VariableInfo>,
@@ -56,14 +57,14 @@ impl<'a> Compiler<'a> {
             let setter = if variable.is_stage {
                 "set_shared_number"
             } else {
-                "set_local_number"
+                "set_existing_local_number"
             };
             line(
                 out,
                 indent,
                 &format!(
-                    "if scratch_defer_{} && scratch_dirty_{} {{ state.{setter}({}, numeric_{}); }}",
-                    variable.slot, variable.slot, variable.slot, variable.slot
+                    "if scratch_defer_writes && scratch_dirty_{} {{ state.{setter}({}, numeric_{}); }}",
+                    variable.slot, variable.slot, variable.slot
                 ),
             );
         }
@@ -148,6 +149,34 @@ impl<'a> Compiler<'a> {
             return Some(NumericExpr {
                 code: format!("!({})", boolean(input)),
                 kind: Kind::Boolean,
+            });
+        }
+        if opcode == "operator_mathop" {
+            let input = self.expr(block.inputs.get("NUM"), written, active)?;
+            if input.kind != Kind::Number {
+                return None;
+            }
+            let operator = field_value(block, "OPERATOR")?.as_str()?;
+            let code = match operator {
+                "sin" => format!("scratch_sin({})", input.code),
+                "cos" => format!("scratch_cos({})", input.code),
+                "tan" => format!("scratch_tan({})", input.code),
+                "asin" => format!("scratch_asin_degrees({})", input.code),
+                "acos" => format!("scratch_acos_degrees({})", input.code),
+                "atan" => format!("scratch_atan_degrees({})", input.code),
+                "abs" => format!("({}).abs()", input.code),
+                "floor" => format!("({}).floor()", input.code),
+                "ceiling" => format!("({}).ceil()", input.code),
+                "sqrt" => format!("({}).sqrt()", input.code),
+                "ln" => format!("({}).ln()", input.code),
+                "log" => format!("({}).log10()", input.code),
+                "e ^" => format!("({}).exp()", input.code),
+                "10 ^" => format!("10.0_f64.powf({})", input.code),
+                _ => return None,
+            };
+            return Some(NumericExpr {
+                code,
+                kind: Kind::Number,
             });
         }
         let (left, right) = if matches!(
@@ -313,7 +342,7 @@ impl<'a> Compiler<'a> {
                             input,
                             self.variables,
                             self.lists,
-                            self.argument_values,
+                            &self.argument_values,
                             &mut HashSet::new(),
                         );
                         let setter = if variable.is_stage {
@@ -334,13 +363,13 @@ impl<'a> Compiler<'a> {
                         let setter = if variable.is_stage {
                             "set_shared_number"
                         } else {
-                            "set_local_number"
+                            "set_existing_local_number"
                         };
                         line(
                             out,
                             indent,
                             &format!(
-                                "if scratch_defer_{slot} {{ numeric_{slot} = numeric_new; scratch_dirty_{slot} = true; }} else {{ state.{setter}({slot}, numeric_new); }}",
+                                "if scratch_defer_writes {{ scratch_dirty_{slot} = true; }} else {{ state.{setter}({slot}, numeric_new); }}",
                                 slot = variable.slot,
                                 setter = setter
                             ),
@@ -352,6 +381,30 @@ impl<'a> Compiler<'a> {
                         &format!("numeric_{} = numeric_new;", variable.slot),
                     );
                     written.insert(variable.slot);
+                }
+                "procedures_call" => {
+                    let callee = procedure_for_call(block, self.procedures)?;
+                    // Zero-argument nested procedures can be safely folded
+                    // into this numeric region. Argument-bearing calls need
+                    // their own type proof and remain on the dynamic path.
+                    if !callee.argument_ids.is_empty() {
+                        return None;
+                    }
+                    let callee_id = callee.definition_id.clone();
+                    let Some(definition) = self.target.blocks.get(&callee_id) else {
+                        return None;
+                    };
+                    let next = definition.next.as_deref();
+                    let previous_arguments = std::mem::take(&mut self.arguments);
+                    let previous_argument_values = std::mem::take(&mut self.argument_values);
+                    let mut nested_written = written.clone();
+                    line(out, indent, "{");
+                    let nested = self.chain(next, &mut nested_written, out, indent + 1, seen);
+                    line(out, indent, "}");
+                    self.arguments = previous_arguments;
+                    self.argument_values = previous_argument_values;
+                    *written = nested_written;
+                    nested?;
                 }
                 "motion_gotoxy" => {
                     let x = self.expr(block.inputs.get("X"), written, &mut HashSet::new())?;
@@ -390,8 +443,10 @@ pub(super) fn generate_numeric_direct(
     procedure: &ProcedureSignature,
     variables: &HashMap<String, VariableInfo>,
     lists: &HashMap<String, ListInfo>,
+    procedures: &[ProcedureSignature],
     name: &str,
     numeric_args_only: bool,
+    proven_numeric_arguments: Option<&[bool]>,
 ) -> Option<String> {
     let args = procedure
         .argument_names
@@ -399,6 +454,13 @@ pub(super) fn generate_numeric_direct(
         .enumerate()
         .map(|(index, name)| (name.clone(), index))
         .collect();
+    let argument_is_numeric = |index: usize| {
+        numeric_args_only
+            || proven_numeric_arguments
+                .and_then(|arguments| arguments.get(index))
+                .copied()
+                .unwrap_or(false)
+    };
     let argument_values = procedure
         .argument_names
         .iter()
@@ -406,7 +468,7 @@ pub(super) fn generate_numeric_direct(
         .map(|(index, name)| {
             (
                 name.clone(),
-                if numeric_args_only {
+                if argument_is_numeric(index) {
                     format!("ScratchValue::Number(numeric_argument_{index})")
                 } else {
                     format!("argument_{index}")
@@ -417,8 +479,9 @@ pub(super) fn generate_numeric_direct(
     let mut compiler = Compiler {
         target,
         variables,
-        argument_values: &argument_values,
+        argument_values,
         lists,
+        procedures,
         arguments: args,
         all: BTreeMap::new(),
         needed: BTreeMap::new(),
@@ -436,14 +499,40 @@ pub(super) fn generate_numeric_direct(
         1,
         &mut HashSet::new(),
     )?;
-    // Avoid creating extra versions of tiny procedures. Numeric calculation
-    // and branch-only procedures benefit too; they need not contain motion.
-    if compiler.statements < 12 {
+    // Avoid creating extra versions of tiny dynamic procedures. A proven
+    // numeric entry path can replace the generic call overhead even for a
+    // small body, so keep that specialization available at every size.
+    let arguments_are_proven_numeric = numeric_args_only
+        || (!procedure.argument_ids.is_empty()
+            && (0..procedure.argument_ids.len()).all(|index| argument_is_numeric(index)));
+    if compiler.statements < 12 && !arguments_are_proven_numeric {
         return None;
+    }
+    let mut argument_operand_caches = Vec::new();
+    for index in 0..procedure.argument_ids.len() {
+        let operand = format!("scratch_number_operand(numeric_argument_{index})");
+        if body.matches(&operand).count() > 1 {
+            body = body.replace(&operand, &format!("scratch_operand_argument_{index}"));
+            argument_operand_caches.push(index);
+        }
+    }
+    let mut variable_operand_caches = Vec::new();
+    for slot in compiler.all.keys() {
+        let operand = format!("scratch_number_operand(numeric_{slot})");
+        if body.matches(&operand).count() > 1 {
+            body = body.replace(&operand, &format!("scratch_operand_{slot}"));
+            body = body.replace(
+                &format!("numeric_{slot} = numeric_new;"),
+                &format!(
+                    "numeric_{slot} = numeric_new; scratch_operand_{slot} = scratch_number_operand(numeric_new);"
+                ),
+            );
+            variable_operand_caches.push(*slot);
+        }
     }
     let params = (0..procedure.argument_ids.len())
         .map(|i| {
-            if numeric_args_only {
+            if argument_is_numeric(i) {
                 format!(", numeric_argument_{i}: f64")
             } else {
                 format!(", argument_{i}: ScratchValue")
@@ -452,7 +541,7 @@ pub(super) fn generate_numeric_direct(
         .collect::<String>();
     let fallback_args = (0..procedure.argument_ids.len())
         .map(|i| {
-            if numeric_args_only {
+            if argument_is_numeric(i) {
                 format!(", ScratchValue::Number(numeric_argument_{i})")
             } else {
                 format!(", argument_{i}")
@@ -478,13 +567,15 @@ pub(super) fn generate_numeric_direct(
     );
     if !numeric_args_only {
         for i in 0..procedure.argument_ids.len() {
-            line(
-                &mut output,
-                1,
-                &format!(
-                    "let Some(numeric_argument_{i}) = argument_{i}.canonical_number() else {{ {fallback} }};"
-                ),
-            );
+            if !argument_is_numeric(i) {
+                line(
+                    &mut output,
+                    1,
+                    &format!(
+                        "let Some(numeric_argument_{i}) = argument_{i}.canonical_number() else {{ {fallback} }};"
+                    ),
+                );
+            }
         }
     }
     for (slot, variable) in &compiler.all {
@@ -499,14 +590,25 @@ pub(super) fn generate_numeric_direct(
                     ),
                 );
             } else {
-                line(
-                    &mut output,
-                    1,
-                    &format!(
-                        "let Some(mut numeric_{slot}) = {}.canonical_number() else {{ {fallback} }};",
-                        variable.read_expression()
-                    ),
-                );
+                if variable.canonical_numeric {
+                    line(
+                        &mut output,
+                        1,
+                        &format!(
+                            "let mut numeric_{slot} = scratch_to_number({});",
+                            variable.read_expression()
+                        ),
+                    );
+                } else {
+                    line(
+                        &mut output,
+                        1,
+                        &format!(
+                            "let Some(mut numeric_{slot}) = {}.canonical_number() else {{ {fallback} }};",
+                            variable.read_expression()
+                        ),
+                    );
+                }
             }
         } else {
             line(
@@ -516,21 +618,58 @@ pub(super) fn generate_numeric_direct(
             );
         }
     }
+    for index in &argument_operand_caches {
+        line(
+            &mut output,
+            1,
+            &format!(
+                "let scratch_operand_argument_{index} = scratch_number_operand(numeric_argument_{index});"
+            ),
+        );
+    }
+    for slot in &variable_operand_caches {
+        line(
+            &mut output,
+            1,
+            &format!("let mut scratch_operand_{slot} = scratch_number_operand(numeric_{slot});"),
+        );
+    }
     let deferred_slots = compiler.deferred_slots();
+    let runtime_deferred = deferred_slots
+        .iter()
+        .copied()
+        .filter(|slot| {
+            compiler
+                .assigned
+                .get(slot)
+                .is_some_and(|variable| !variable.monitor_visible)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if runtime_deferred.is_empty() {
+        line(&mut output, 1, "let scratch_defer_writes = false;");
+    } else {
+        line(
+            &mut output,
+            1,
+            &format!(
+                "let scratch_defer_writes = state.can_defer_variable_write_mask({});",
+                variable_write_mask(runtime_deferred.iter().copied())
+            ),
+        );
+    }
     for slot in compiler.assigned.keys() {
-        if deferred_slots.contains(slot) {
-            line(
-                &mut output,
-                1,
-                &format!("let scratch_defer_{slot} = state.can_defer_variable_writes(&[{slot}]);"),
-            );
-        } else {
-            line(
-                &mut output,
-                1,
-                &format!("let scratch_defer_{slot} = false;"),
-            );
-        }
+        line(
+            &mut output,
+            1,
+            &format!(
+                "let scratch_defer_{slot} = {};",
+                if runtime_deferred.contains(slot) {
+                    "scratch_defer_writes"
+                } else {
+                    "false"
+                }
+            ),
+        );
     }
     for slot in compiler.assigned.keys() {
         line(
